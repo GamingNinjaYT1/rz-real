@@ -392,6 +392,8 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
         # like a human and returns the verdict from the gateway's own response.
         # SITE_FAIL/ERROR per site → try next; verdict → return. ──
         pay_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pay.py")
+        walker_attempts = 0
+        last_walker_resp = ""
         for site in candidate_sites:
             args = {"site": site, "card": cc, "mm": mm, "yy": str(year_full), "cvv": cvv,
                     "proxy_server": None, "proxy_user": None, "proxy_pass": None}
@@ -408,6 +410,8 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
                 )
                 out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=80)
                 data = json.loads(out_b.decode(errors="ignore"))
+                walker_attempts += 1
+                last_walker_resp = f"{site}: {data.get('response', '')}"
             except Exception:
                 continue
             st = str(data.get("status", "")).upper()
@@ -417,6 +421,13 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
                               raw_response=str(data.get("raw", ""))[:4000])
                 return result
             # SITE_FAIL / ERROR → next candidate site
+
+        if walker_attempts:
+            msg = "All Razorpay endpoints busy or deactivated"
+            if last_walker_resp:
+                msg = f"{msg} — last: {last_walker_resp}"
+            result.update(status="DECLINED", message="Payment Page Unavailable", response=msg)
+            return result
 
         last_fail = ""
         for site in candidate_sites:
