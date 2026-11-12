@@ -10,7 +10,8 @@ Flask server on port 5003.
   Requests WITHOUT proxy are rejected — the proxy is MANDATORY
   (razorpay blocks datacenter IPs at the payment step — only resi egress works).
 """
-import sys, os, json, time, asyncio, threading
+import sys, os, json, time, asyncio, threading, subprocess
+from urllib.parse import urlsplit
 from flask import Flask, request, jsonify
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
@@ -78,6 +79,29 @@ def razorpay_check():
             "Response": f"Error: {_exc(e)}",
             "Status": False, "IP": proxy or "no", "timetaken": f"{time.time()-t0:.1f}s",
         })
+
+@app.route("/debug-captcha")
+def debug_captcha():
+    site = request.args.get("site", "").strip()
+    proxy = request.args.get("proxy", "").strip()
+    if not site:
+        return jsonify({"error": "missing site"})
+    args = {"site": site, "proxy_server": None, "proxy_user": None, "proxy_pass": None}
+    if proxy:
+        u = urlsplit(proxy if proxy.startswith("http") else "http://" + proxy)
+        args["proxy_server"] = f"{u.scheme or 'http'}://{u.hostname}:{u.port or 8080}"
+        if u.username:
+            args["proxy_user"] = u.username
+            args["proxy_pass"] = u.password or ""
+    cap_py = os.path.join(_BASE, "gates", "hsin_rz", "captcha.py")
+    try:
+        proc = subprocess.run([sys.executable, cap_py, json.dumps(args)],
+                              capture_output=True, text=True, timeout=120)
+        return jsonify({"py": sys.executable, "rc": proc.returncode,
+                        "stdout": proc.stdout[:2000], "stderr": proc.stderr[:2000]})
+    except Exception as e:
+        return jsonify({"py": sys.executable, "error": _exc(e)})
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5003)), debug=False)
