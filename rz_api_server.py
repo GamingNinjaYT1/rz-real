@@ -36,7 +36,7 @@ def process_rz(cc, mm, yy, cvv, proxy_str=None, site=None):
         check_razorpay(cc, mm, yy, cvv, proxy=proxy_str, site=site),
         _loop
     )
-    result = fut.result(timeout=240)
+    result = fut.result(timeout=300)
     return result
 
 @app.route("/razorpay-135-1")

