@@ -142,6 +142,7 @@ def main():
             pg.wait_for_timeout(1500)
 
             verdict = None
+            server_errs = 0
             for attempt in range(3):
                 before = len(api_hits)
                 try:
@@ -169,6 +170,9 @@ def main():
                     if isinstance(err, dict):
                         desc = err.get("description", "")
                         if "trouble completing" in desc.lower():
+                            server_errs += 1
+                            if server_errs >= 2:
+                                out({"status": "SITE_FAIL", "response": "razorpay server error (500) on payment", "site": site, "raw": h["body"][:800]})
                             continue  # server 500 — retry
                         verdict = {"status": "DECLINED", "response": desc or err.get("reason", "Payment failed"), "raw": h["body"][:1500]}
                         break

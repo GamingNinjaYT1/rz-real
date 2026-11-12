@@ -50,7 +50,7 @@ async def mint_rz_captcha(site: str, proxy: str = None) -> dict:
             os.environ.get("RZ_CAPTCHA_PYTHON", sys.executable), cap_py, json.dumps(args),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=80)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=110)
         data = json.loads(out.decode(errors="ignore"))
         return data.get("captcha") or {}
     except Exception:
@@ -394,7 +394,7 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
         pay_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pay.py")
         walker_attempts = 0
         last_walker_resp = ""
-        for site in candidate_sites:
+        for site in candidate_sites[:2]:
             args = {"site": site, "card": cc, "mm": mm, "yy": str(year_full), "cvv": cvv,
                     "proxy_server": None, "proxy_user": None, "proxy_pass": None}
             if proxy:
@@ -408,7 +408,7 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
                     os.environ.get("RZ_CAPTCHA_PYTHON", sys.executable), pay_py, json.dumps(args),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                 )
-                out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=80)
+                out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=110)
                 data = json.loads(out_b.decode(errors="ignore"))
                 walker_attempts += 1
                 last_walker_resp = f"{site}: {data.get('response', '')}"
