@@ -50,7 +50,7 @@ async def mint_rz_captcha(site: str, proxy: str = None) -> dict:
             os.environ.get("RZ_CAPTCHA_PYTHON", sys.executable), cap_py, json.dumps(args),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=110)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=80)
         data = json.loads(out.decode(errors="ignore"))
         return data.get("captcha") or {}
     except Exception:
@@ -406,7 +406,7 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
                     os.environ.get("RZ_CAPTCHA_PYTHON", sys.executable), pay_py, json.dumps(args),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                 )
-                out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=110)
+                out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=80)
                 data = json.loads(out_b.decode(errors="ignore"))
             except Exception:
                 continue

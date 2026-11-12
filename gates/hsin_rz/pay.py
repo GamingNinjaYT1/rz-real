@@ -73,25 +73,25 @@ def main():
 
         try:
             pg.goto(site, timeout=60000, wait_until="domcontentloaded")
-            pg.wait_for_timeout(5000)
+            pg.wait_for_timeout(3500)
             amt = pg.query_selector("input[type=number]")
             pay_btn = pg.query_selector("input[type=button]")
             if not amt or not pay_btn:
                 out({"status": "SITE_FAIL", "response": "not a payment page", "site": site, "raw": ""})
             amt.fill("1")
             pay_btn.click()
-            pg.wait_for_timeout(10000)
+            pg.wait_for_timeout(7000)
 
             cf = None
             for _ in range(6):
                 cf = next((f for f in pg.frames if "api.razorpay.com" in f.url and "checkout" in f.url), None)
                 if cf:
                     try:
-                        cf.wait_for_selector("input[name=contact], input[type=radio], input[name='card.number']", timeout=5000)
+                        cf.wait_for_selector("input[name=contact], input[type=radio], input[name='card.number']", timeout=4000)
                         break
                     except Exception:
                         cf = None
-                pg.wait_for_timeout(3000)
+                pg.wait_for_timeout(2500)
             if not cf:
                 out({"status": "SITE_FAIL", "response": "checkout did not open", "site": site, "raw": ""})
 
@@ -106,16 +106,16 @@ def main():
                     cf.click("button:has-text('Continue')", timeout=5000)
                 except Exception:
                     cf.evaluate("""() => { for (const bt of document.querySelectorAll('button')) if ((bt.textContent||'').includes('Continue')) { bt.click(); break; } }""")
-                pg.wait_for_timeout(7000)
+                pg.wait_for_timeout(5000)
 
             # card method
             cf.evaluate("""() => { for (const r of document.querySelectorAll('input[type=radio]')) { const lab = r.closest('label,div')?.textContent || ''; if (/card/i.test(lab)) { r.click(); break; } } }""")
-            pg.wait_for_timeout(5000)
+            pg.wait_for_timeout(3500)
 
             card_input = None
             for sel in ("input[name='card.number']", "input[name='card[number]']"):
                 try:
-                    cf.wait_for_selector(sel, timeout=6000)
+                    cf.wait_for_selector(sel, timeout=5000)
                     card_input = cf.query_selector(sel)
                     if card_input:
                         num_sel, exp_sel, cvv_sel = sel.replace("number", "number"), None, None
@@ -154,7 +154,7 @@ def main():
                     }""")
                 except Exception:
                     clicked = "detached"
-                pg.wait_for_timeout(12000)
+                pg.wait_for_timeout(9000)
 
                 new_hits = api_hits[before:]
                 # find the checkout/order POST verdict
