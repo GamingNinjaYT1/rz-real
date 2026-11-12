@@ -98,7 +98,7 @@ def debug_captcha():
         proc = subprocess.run([sys.executable, cap_py, json.dumps(args)],
                               capture_output=True, text=True, timeout=120)
         return jsonify({"py": sys.executable, "rc": proc.returncode,
-                        "stdout": proc.stdout[:2000], "stderr": proc.stderr[:2000]})
+                        "stdout": proc.stdout[:2000], "stderr": proc.stderr[-3000:]})
     except Exception as e:
         return jsonify({"py": sys.executable, "error": _exc(e)})
 
