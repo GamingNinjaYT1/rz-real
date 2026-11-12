@@ -309,6 +309,16 @@ def gen_indian_phone() -> str:
 
 
 async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None, site: str = None) -> dict:
+    # ── proxy is MANDATORY — razorpay blocks datacenter IPs at checkout ──
+    if not proxy or str(proxy).strip() in ("", "no"):
+        return {
+            "status": "ERROR", "is_live": False,
+            "response": "proxy parameter is MANDATORY — razorpay blocks datacenter IPs at the checkout step. "
+                        "Use a resi proxy: GET /razorpay-135-1?cc=...&proxy=http://user:pass@host:port",
+            "message": "proxy is MANDATORY",
+            "cc": f"{cc}|{mm}|{yy}|{cvv}",
+            "gateway_name": "Razorpay ₹1",
+        }
     proxy = proxy or getattr(config, "ROTATING_PROXY_HTTP", None)
     result = {
         "status": "ERROR",

