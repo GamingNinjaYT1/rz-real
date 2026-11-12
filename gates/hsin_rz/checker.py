@@ -402,7 +402,7 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
         pay_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pay.py")
         walker_attempts = 0
         last_walker_resp = ""
-        for site in list(candidate_sites):
+        for site in list(candidate_sites)[:2]:
             args = {"site": site, "card": cc, "mm": mm, "yy": str(year_full), "cvv": cvv,
                     "proxy_server": None, "proxy_user": None, "proxy_pass": None}
             if proxy:
