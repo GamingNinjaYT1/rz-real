@@ -416,7 +416,14 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
                     os.environ.get("RZ_CAPTCHA_PYTHON", sys.executable), pay_py, json.dumps(args),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                 )
-                out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=110)
+                try:
+                    out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=110)
+                except (asyncio.TimeoutError, Exception):
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    raise
                 data = json.loads(out_b.decode(errors="ignore"))
                 walker_attempts += 1
                 last_walker_resp = f"{site}: {data.get('response', '')}"

@@ -31,13 +31,17 @@ def _exc(e):
     msg = str(e) or repr(e)
     return f"{name}: {msg}" if msg else name
 
+_th_lock = _th.Lock()
+
 def process_rz(cc, mm, yy, cvv, proxy_str=None, site=None):
-    fut = asyncio.run_coroutine_threadsafe(
-        check_razorpay(cc, mm, yy, cvv, proxy=proxy_str, site=site),
-        _loop
-    )
-    result = fut.result(timeout=280)
-    return result
+    # one browser walker at a time — two concurrent chromiums OOM the 512MB container
+    with _th_lock:
+        fut = asyncio.run_coroutine_threadsafe(
+            check_razorpay(cc, mm, yy, cvv, proxy=proxy_str, site=site),
+            _loop
+        )
+        result = fut.result(timeout=280)
+        return result
 
 @app.route("/razorpay-135-1")
 def razorpay_check():
