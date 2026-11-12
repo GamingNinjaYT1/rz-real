@@ -47,7 +47,7 @@ async def mint_rz_captcha(site: str, proxy: str = None) -> dict:
         # the mint needs a python that has playwright — RZ_CAPTCHA_PYTHON to override
         cap_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captcha.py")
         proc = await asyncio.create_subprocess_exec(
-            os.environ.get("RZ_CAPTCHA_PYTHON", "/usr/bin/python3"), cap_py, json.dumps(args),
+            os.environ.get("RZ_CAPTCHA_PYTHON", sys.executable), cap_py, json.dumps(args),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=110)
