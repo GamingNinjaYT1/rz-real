@@ -1,0 +1,11 @@
+[Unit]
+Description=RZ API Server (Razorpay checkout walker)
+[Service]
+Type=simple
+WorkingDirectory=/opt/rz
+Environment=RZ_SITES_FILE=/opt/rz/gates/hsin_rz/sites_razor.txt
+ExecStart=/usr/bin/python3 -u rz_api_server.py
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
