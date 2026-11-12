@@ -384,8 +384,6 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
                 "country_flag": bin_info.get("country_flag") or "🏳️",
                 "bank": bin_info.get("bank") or "",
             }
-        random.shuffle(candidate_sites)
-
         # ── 0. Browser walker first — the aiohttp create/ajax gets blocked by
         # razorpay's risk/WAF layer (403) because the shield payload is
         # incomplete; a real browser session passes it. pay.py walks the page
@@ -394,7 +392,7 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
         pay_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pay.py")
         walker_attempts = 0
         last_walker_resp = ""
-        for site in candidate_sites[:2]:
+        for site in list(candidate_sites):
             args = {"site": site, "card": cc, "mm": mm, "yy": str(year_full), "cvv": cvv,
                     "proxy_server": None, "proxy_user": None, "proxy_pass": None}
             if proxy:
