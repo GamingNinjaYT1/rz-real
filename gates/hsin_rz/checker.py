@@ -422,7 +422,7 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
         pay_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pay.py")
         walker_attempts = 0
         last_walker_resp = ""
-        used_proxies = {proxy}
+        used_proxies = set()
         walker_t0 = time.time()
         for site in list(candidate_sites)[:2]:
             # up to 3 passes per site: pages like razorpay.me reject some proxy
@@ -434,11 +434,14 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
                     break
                 args = {"site": site, "card": cc, "mm": mm, "yy": str(year_full), "cvv": cvv,
                         "proxy_server": None, "proxy_user": None, "proxy_pass": None}
-                if attempt_no == 2:
-                    fresh = next((p for p in get_alive_pool_http() if p not in used_proxies), None)
+                if attempt_no > 1:
+                    def _hp(s):
+                        v = urlsplit(s if str(s).startswith("http") else "http://" + str(s))
+                        return (v.hostname or "", v.port or 8080)
+                    fresh = next((p for p in get_alive_pool_http() if _hp(p) not in used_proxies), None)
                     if not fresh:
                         break
-                    used_proxies.add(fresh)
+                    used_proxies.add(_hp(fresh))
                     proxy = fresh
                 if proxy:
                     u = urlsplit(proxy if proxy.startswith("http") else "http://" + proxy)
