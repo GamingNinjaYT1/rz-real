@@ -491,6 +491,11 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
                         f"proxy={args.get('proxy_server')} status={data.get('status')} "
                         f"resp={str(data.get('response'))[:80]}", flush=True)
                   st = str(data.get("status", "")).upper()
+                  # Razorpay's create/ajax SERVER_ERROR is intermittent per
+                  # session — not a card verdict; retry the walk on a fresh proxy
+                  if st == "DECLINED" and "SERVER_ERROR" in str(data.get("response", "")).upper():
+                      last_walker_resp = f"{site}: {data.get('response', '')}"
+                      continue
                   if st in ("APPROVED", "DECLINED", "REQUIRES_ACTION"):
                       resp_text = str(data.get("response") or "Payment failed")
                       result.update(status=st, message=resp_text, response=resp_text,
