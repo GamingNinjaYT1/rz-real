@@ -71,7 +71,7 @@ def parse_hits(hits):
                 return "AJAX_SERVER_ERR", None
             if "connection error" in desc.lower():
                 # gateway↔issuer network failure — infrastructure, retryable
-                return "SERVER_ERR", None
+                return "GATEWAY_CONN_ERR", None
             return "VERDICT", map_verdict(err, body[:1500])
         st = str(j.get("status", "")).lower()
         if st in ("captured", "authorized", "paid"):
@@ -331,6 +331,9 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
                 server_errs += 1
             if kind == "AJAX_SERVER_ERR":
                 saw_ajax_err = True
+            if kind == "GATEWAY_CONN_ERR":
+                # gateway↔issuer network failure — retry with a fresh session
+                raise _WalkFail({"status": "SITE_FAIL", "response": "gateway connection error", "site": site, "raw": ""})
             # DCC pay button (trusted click required)
             try:
                 has_pay = cf.evaluate("() => { const btns=[...document.querySelectorAll('button')].filter(b=>b.offsetParent&&!b.disabled); for (const bt of btns) { const t=(bt.textContent||'').trim(); if (/^pay/i.test(t)) return 1; } return 0; }")
