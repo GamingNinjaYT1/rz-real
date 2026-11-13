@@ -144,18 +144,16 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
             if pay_btn is not True:
                 pay_btn.click()
             pg.wait_for_timeout(6000)
-            for _ in range(3):
+            # poll for a checkout frame that actually renders content — the
+            # canary build loads as an empty frame and never wakes up, a good
+            # build can take a few extra seconds to paint
+            for _ in range(6):
                 cf = next((f for f in pg.frames if "api.razorpay.com" in f.url and "checkout" in f.url), None)
-                if cf:
-                    try:
-                        cf.wait_for_selector("input, button", timeout=5000)
-                    except Exception:
-                        cf = None
-                if cf:
+                if cf and cf.evaluate("()=>!!(document.querySelector('input,button'))"):
+                    opened = True
                     break
                 pg.wait_for_timeout(2000)
-            if cf and cf.evaluate("()=>!!(document.querySelector('input,button'))"):
-                opened = True
+            if opened:
                 break
         if not opened:
             raise _WalkFail({"status": "SITE_FAIL", "response": "checkout did not open", "site": site, "raw": ""})
