@@ -15,8 +15,14 @@ import types as _types
 try:
     from proxy import get_alive_pool_http
 except Exception:
-    def get_alive_pool_http():
-        return []
+    try:
+        from database import get_global_proxies
+
+        def get_alive_pool_http():
+            return get_global_proxies()
+    except Exception:
+        def get_alive_pool_http():
+            return []
 config = _types.ModuleType("rz_config")
 config.ROTATING_PROXY_HTTP = None
 RAZORPAY_PAGE_URL = "https://pages.razorpay.com/myglobalhost"
