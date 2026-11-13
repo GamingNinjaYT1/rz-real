@@ -423,11 +423,15 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
         walker_attempts = 0
         last_walker_resp = ""
         used_proxies = {proxy}
+        walker_t0 = time.time()
         for site in list(candidate_sites)[:2]:
-            # two passes per site: pages like razorpay.me reject some proxy IPs
-            # outright ("Couldn't verify this request") — retry once on a fresh
-            # proxy before moving to the next site
-            for attempt_no in (1, 2):
+            # up to 3 passes per site: pages like razorpay.me reject some proxy
+            # IPs outright ("Couldn't verify this request") and others flake
+            # mid-walk ("Gateway Connection Error") — each retry takes a fresh
+            # proxy; wall-clock guard keeps us inside the 280s budget
+            for attempt_no in (1, 2, 3):
+                if attempt_no > 1 and time.time() - walker_t0 > 230:
+                    break
                 args = {"site": site, "card": cc, "mm": mm, "yy": str(year_full), "cvv": cvv,
                         "proxy_server": None, "proxy_user": None, "proxy_pass": None}
                 if attempt_no == 2:
