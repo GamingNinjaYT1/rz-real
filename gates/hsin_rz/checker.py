@@ -380,7 +380,15 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
         keyless_header = ""
         kyid = "rzp_live_GgVi6JQjMbAj2q"
 
-        candidate_sites = [site.strip() if str(site).strip().startswith("http") else "https://" + str(site).strip()] if site and str(site).strip() else load_razorpay_sites()
+        if site and str(site).strip():
+            s = str(site).strip()
+            if s.startswith("@"):
+                s = "https://razorpay.me/" + s
+            elif not s.startswith("http"):
+                s = "https://" + s
+            candidate_sites = [s]
+        else:
+            candidate_sites = load_razorpay_sites()
         if not candidate_sites:
             return {
                 "status": "ERROR",
