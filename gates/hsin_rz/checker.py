@@ -12,6 +12,26 @@ from urllib.parse import quote, urlsplit
 import aiohttp
 import types as _types
 
+def _norm_proxy(s) -> str:
+    """Normalize pool formats (host:port:user:pass, user:pass@host:port, url) to http URLs."""
+    s = str(s).strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    if "@" in s:
+        creds, hostport = s.rsplit("@", 1)
+        return f"http://{creds}@{hostport}"
+    parts = s.split(":")
+    if len(parts) == 4:
+        host, port, user, pwd = parts
+        return f"http://{user}:{pwd}@{host}:{port}"
+    return "http://" + s
+
+
+def _hp(s):
+    v = urlsplit(_norm_proxy(s))
+    return (v.hostname or "", v.port or 8080)
+
+
 try:
     from proxy import get_alive_pool_http
 except Exception:
@@ -424,57 +444,63 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
         last_walker_resp = ""
         used_proxies = set()
         walker_t0 = time.time()
-        for site in list(candidate_sites)[:2]:
-            # up to 3 passes per site: pages like razorpay.me reject some proxy
-            # IPs outright ("Couldn't verify this request") and others flake
-            # mid-walk ("Gateway Connection Error") — each retry takes a fresh
-            # proxy; wall-clock guard keeps us inside the 280s budget
-            for attempt_no in (1, 2, 3):
-                if attempt_no > 1 and time.time() - walker_t0 > 230:
-                    break
-                args = {"site": site, "card": cc, "mm": mm, "yy": str(year_full), "cvv": cvv,
-                        "proxy_server": None, "proxy_user": None, "proxy_pass": None}
-                if attempt_no > 1:
-                    def _hp(s):
-                        v = urlsplit(s if str(s).startswith("http") else "http://" + str(s))
-                        return (v.hostname or "", v.port or 8080)
-                    fresh = next((p for p in get_alive_pool_http() if _hp(p) not in used_proxies), None)
-                    if not fresh:
-                        break
-                    used_proxies.add(_hp(fresh))
-                    proxy = fresh
-                if proxy:
-                    u = urlsplit(proxy if proxy.startswith("http") else "http://" + proxy)
-                    args["proxy_server"] = f"{u.scheme or 'http'}://{u.hostname}:{u.port or 8080}"
-                    if u.username:
-                        args["proxy_user"] = u.username
-                        args["proxy_pass"] = u.password or ""
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        os.environ.get("RZ_CAPTCHA_PYTHON", sys.executable), pay_py, json.dumps(args),
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    try:
-                        out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=110)
-                    except (asyncio.TimeoutError, Exception):
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                        raise
-                    data = json.loads(out_b.decode(errors="ignore"))
-                except Exception:
-                    break
-                walker_attempts += 1
-                last_walker_resp = f"{site}: {data.get('response', '')}"
-                st = str(data.get("status", "")).upper()
-                if st in ("APPROVED", "DECLINED", "REQUIRES_ACTION"):
-                    resp_text = str(data.get("response") or "Payment failed")
-                    result.update(status=st, message=resp_text, response=resp_text,
-                                  raw_response=str(data.get("raw", ""))[:4000])
-                    return result
-                # SITE_FAIL / ERROR → retry same site on a fresh proxy, then next site
+        try:
+          for site in list(candidate_sites)[:2]:
+              # up to 3 passes per site: pages like razorpay.me reject some proxy
+              # IPs outright ("Couldn't verify this request") and others flake
+              # mid-walk ("Gateway Connection Error") — each retry takes a fresh
+              # proxy; wall-clock guard keeps us inside the 280s budget
+              for attempt_no in (1, 2, 3):
+                  if attempt_no > 1 and time.time() - walker_t0 > 120:
+                      break
+                  print(f"[RZWALK] enter site={site} attempt={attempt_no} t={time.time()-walker_t0:.0f}s", flush=True)
+                  args = {"site": site, "card": cc, "mm": mm, "yy": str(year_full), "cvv": cvv,
+                          "proxy_server": None, "proxy_user": None, "proxy_pass": None}
+                  if attempt_no > 1:
+                      fresh = next((p for p in get_alive_pool_http() if _hp(p) not in used_proxies), None)
+                      if not fresh:
+                          break
+                      proxy = _norm_proxy(fresh)
+                  if proxy:
+                      used_proxies.add(_hp(proxy))
+                      u = urlsplit(proxy)
+                      args["proxy_server"] = f"{u.scheme or 'http'}://{u.hostname}:{u.port or 8080}"
+                      if u.username:
+                          args["proxy_user"] = u.username
+                          args["proxy_pass"] = u.password or ""
+                  try:
+                      proc = await asyncio.create_subprocess_exec(
+                          os.environ.get("RZ_CAPTCHA_PYTHON", sys.executable), pay_py, json.dumps(args),
+                          stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                      )
+                      try:
+                          out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=140)
+                      except (asyncio.TimeoutError, Exception):
+                          try:
+                              proc.kill()
+                          except Exception:
+                              pass
+                          raise
+                      data = json.loads(out_b.decode(errors="ignore"))
+                  except Exception as e:
+                      print(f"[RZWALK] attempt={attempt_no} subprocess EXC: {type(e).__name__}", flush=True)
+                      break
+                  walker_attempts += 1
+                  last_walker_resp = f"{site}: {data.get('response', '')}"
+                  print(f"[RZWALK] site={site} attempt={attempt_no} "
+                        f"proxy={args.get('proxy_server')} status={data.get('status')} "
+                        f"resp={str(data.get('response'))[:80]}", flush=True)
+                  st = str(data.get("status", "")).upper()
+                  if st in ("APPROVED", "DECLINED", "REQUIRES_ACTION"):
+                      resp_text = str(data.get("response") or "Payment failed")
+                      result.update(status=st, message=resp_text, response=resp_text,
+                                    raw_response=str(data.get("raw", ""))[:4000])
+                      return result
+                  # SITE_FAIL / ERROR → retry same site on a fresh proxy, then next site
 
+        except Exception as _wexc:
+            print(f"[RZWALK] LOOP EXC: {type(_wexc).__name__}: {str(_wexc)[:150]}", flush=True)
+        print(f"[RZWALK] done attempts={walker_attempts} last={last_walker_resp[:80]}", flush=True)
         if walker_attempts:
             msg = last_walker_resp or "Razorpay checkout did not respond"
             result.update(status="DECLINED", message="Payment Page Unavailable", response=msg)

