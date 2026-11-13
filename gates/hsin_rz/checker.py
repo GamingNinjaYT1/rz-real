@@ -446,9 +446,7 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
             # SITE_FAIL / ERROR → next candidate site
 
         if walker_attempts:
-            msg = "All Razorpay endpoints busy or deactivated"
-            if last_walker_resp:
-                msg = f"{msg} — last: {last_walker_resp}"
+            msg = last_walker_resp or "Razorpay checkout did not respond"
             result.update(status="DECLINED", message="Payment Page Unavailable", response=msg)
             return result
 
@@ -532,9 +530,7 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
                 continue
 
         if not init_data or not order_id:
-            msg = "All Razorpay endpoints busy or deactivated"
-            if last_fail:
-                msg = f"{msg} — last: {last_fail}"
+            msg = last_fail or "Razorpay checkout did not respond"
             result.update(status="DECLINED", message="Payment Page Unavailable", response=msg)
             return result
 

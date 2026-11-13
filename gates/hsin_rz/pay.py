@@ -203,6 +203,20 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
             except Exception:
                 continue
         if not num_sel:
+            # the radio click may have landed pre-render — re-click Cards and re-check
+            for _ in range(2):
+                cf.evaluate("() => { for (const r of document.querySelectorAll('input[type=radio]')) { const lab = r.closest('label,div')?.textContent || ''; if (/card/i.test(lab) && r.offsetWidth) { r.click(); return true; } } return false; }")
+                pg.wait_for_timeout(4000)
+                for sel in ("input[name='card.number']", "input[name='card[number]']"):
+                    try:
+                        cf.wait_for_selector(sel, timeout=4000)
+                        num_sel = sel
+                        break
+                    except Exception:
+                        continue
+                if num_sel:
+                    break
+        if not num_sel:
             raise _WalkFail({"status": "SITE_FAIL", "response": "card form did not render", "site": site, "raw": ""})
         dot = "card.number" in num_sel
         exp_sel = "input[name='card.expiry']" if dot else "input[name='card[expiry]']"
