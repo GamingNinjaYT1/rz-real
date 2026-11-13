@@ -67,6 +67,11 @@ def parse_hits(hits):
             desc = str(err.get("description", "") or "")
             if "trouble completing" in desc.lower():
                 return "SERVER_ERR", None
+            if "server encountered an error" in desc.lower():
+                return "AJAX_SERVER_ERR", None
+            if "connection error" in desc.lower():
+                # gateway↔issuer network failure — infrastructure, retryable
+                return "SERVER_ERR", None
             return "VERDICT", map_verdict(err, body[:1500])
         st = str(j.get("status", "")).lower()
         if st in ("captured", "authorized", "paid"):
