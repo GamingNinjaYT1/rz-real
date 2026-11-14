@@ -107,5 +107,85 @@ def debug_captcha():
         return jsonify({"py": sys.executable, "error": _exc(e)})
 
 
+
+# ── PayPal lanes (ported from pp_api_server.py) ─────────────────────────────
+_PP_FIELDS = ("client_id", "client_secret", "amount",
+              "firstName", "lastName", "email",
+              "address1", "city", "state", "zip", "country")
+
+def _pp_out(cc, res, amount, t0, include_debug):
+    status = str(res.get("status", "ERROR")).upper()
+    out = {
+        "cc": cc, "Gateway": "PayPal Key [1$]",
+        "Status": status,
+        "Response": str(res.get("response", ""))[:70],
+        "Price": amount or "1.00",
+        "Currency": "USD",
+        "IP": "64.4.168.78",
+        "timetaken": f"{time.time()-t0:.1f}s",
+    }
+    if include_debug:
+        out["Decline"] = res.get("decline_code") or ""
+        out["Raw"] = json.dumps(res, default=str)[:1500]
+    return out
+
+def _pp_kwargs():
+    kwargs = {}
+    for param in _PP_FIELDS:
+        val = request.args.get(param)
+        if val:
+            kwargs[param] = val
+    kwargs.setdefault("amount", "1.00")
+    return kwargs
+
+def _pp_run(runner, cc):
+    t0 = time.time()
+    parts = cc.split("|")
+    kwargs = _pp_kwargs()
+    kwargs["proxy_str"] = normalize_proxy(request.args.get("proxy", ""))
+    res = runner(parts[0], parts[1].zfill(2), parts[2][-2:], parts[3], **kwargs)
+    dbg = request.args.get("debug", "").lower() in ("yes", "1", "true")
+    return _pp_out(cc, res, kwargs.get("amount"), t0, dbg)
+
+def _normalize_proxy_render(raw):
+    raw = (raw or "").strip()
+    if not raw or raw.lower() in ("no", "live", "none"):
+        return ""
+    if raw.startswith("http"):
+        u = urlsplit(raw)
+        host, port = u.hostname, u.port or (443 if u.scheme == "https" else 8080)
+        if u.username:
+            return f"{host}:{port}:{u.username}:{u.password or ''}"
+        return f"{host}:{port}"
+    return raw
+
+normalize_proxy = _normalize_proxy_render
+
+@app.route("/pp")
+@app.route("/paypal-1")
+def pp_check():
+    from gates.paypal_direct import run_check
+    cc = request.args.get("cc", "").strip()
+    if not cc or "|" not in cc:
+        return jsonify({"error": "missing or invalid cc — format CC|MM|YY|CVV"}), 400
+    return jsonify(_pp_run(run_check, cc))
+
+@app.route("/ppdirect")
+def pp_direct():
+    from gates.paypal_direct import run_check
+    cc = request.args.get("cc", "").strip()
+    if not cc or "|" not in cc:
+        return jsonify({"error": "cc=CC|MM|YY|CVV"}), 400
+    return jsonify(_pp_run(run_check, cc))
+
+@app.route("/ppcvv")
+def pp_cvv():
+    from gates.paypal_cvv import run_paypal_check
+    cc = request.args.get("cc", "").strip()
+    if not cc or "|" not in cc:
+        return jsonify({"error": "cc=CC|MM|YY|CVV"}), 400
+    return jsonify(_pp_run(run_paypal_check, cc))
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5003)), debug=False)
