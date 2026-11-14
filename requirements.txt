@@ -3,3 +3,4 @@ aiohttp>=3.9
 playwright==1.49.0
 requests>=2.31
 curl_cffi>=0.7
+fake-useragent>=1.4

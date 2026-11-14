@@ -322,5 +322,44 @@ def stripe_auth_check():
     })
 
 
+
+
+# ─── Stripe Auth site-rotation lane (root stripeauth engine, proxied) ───
+_sa_exec = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+@app.route("/sa")
+def sa_check():
+    cc = request.args.get("cc", "")
+    if not cc or "|" not in cc:
+        return jsonify({"error": "missing or invalid cc — use /sa?cc=<card|mm|yy|cvv>"}), 400
+    proxy = request.args.get("proxy", "").strip()
+    t0 = time.time()
+    fut = _sa_exec.submit(_sa_run, cc)
+    try:
+        res = fut.result(timeout=240)
+    except concurrent.futures.TimeoutError:
+        fut.cancel()
+        return jsonify({"error": "stripe auth timed out"}), 504
+    except Exception as e:
+        return jsonify({"error": f"internal error: {type(e).__name__}"}), 500
+    status = str(res.get("status", "ERROR")).upper()
+    response = str(res.get("response") or "Unknown")
+    return jsonify({
+        "cc": cc,
+        "Gateway": "Stripe Auth",
+        "Status": status,
+        "Response": response,
+        "Price": "0",
+        "Currency": "USD",
+        "IP": proxy.split("@")[-1].split(":")[0] if "@" in proxy else (proxy or "direct"),
+        "timetaken": f"{time.time()-t0:.1f}s",
+    })
+
+def _sa_run(cc):
+    from gates.stripeauth_sites import process_stripe_auth as _psa
+    import asyncio as _aio
+    return _aio.run(_psa(cc))
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5003)), debug=False)
