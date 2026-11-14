@@ -127,7 +127,7 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
         cf = None
         for _open_try in range(3):
             pg.goto(site, timeout=60000, wait_until="domcontentloaded")
-            pg.wait_for_timeout(2500)
+            pg.wait_for_timeout(1500)
             amt = pg.query_selector("input[type=number]")
             pay_btn = pg.query_selector("input[type=button]")
             if not pay_btn:
@@ -145,18 +145,24 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
                         pay_btn = True
                         break
             if not amt and not pay_btn:
-                raise _WalkFail({"status": "SITE_FAIL", "response": "not a payment page", "site": site, "raw": ""})
+                # rzp.io short links and some pages.razorpay.com pages open the
+                # checkout widget by themselves — give it a beat before failing
+                pg.wait_for_timeout(2500)
+                cf0 = next((f for f in pg.frames if "api.razorpay.com" in f.url and "checkout" in f.url), None)
+                if not cf0:
+                    raise _WalkFail({"status": "SITE_FAIL", "response": "not a payment page", "site": site, "raw": ""})
+                pg.wait_for_timeout(2500)
             if amt:
                 amt.fill("1")
             if pay_btn is not True:
                 pay_btn.click()
-            pg.wait_for_timeout(6000)
+            pg.wait_for_timeout(1500)
             # poll for a checkout frame that actually renders content — the
             # canary build loads as an empty frame and never wakes up, a good
             # build can take a few extra seconds to paint; a "Couldn't verify"
             # rejection is deterministic for this IP → stop waiting
             rejected = False
-            for _ in range(6):
+            for _ in range(9):
                 cf = next((f for f in pg.frames if "api.razorpay.com" in f.url and "checkout" in f.url), None)
                 if cf and cf.evaluate("()=>!!(document.querySelector('input,button'))"):
                     opened = True
@@ -164,7 +170,7 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
                 if pg.evaluate("()=>{const e=[...document.querySelectorAll('div,span,p')].find(e=>e.offsetParent&&/couldn.t verify|request could not be verified/i.test(e.textContent||'')&&e.textContent.length<80);return e?1:0}"):
                     rejected = True
                     break
-                pg.wait_for_timeout(2000)
+                pg.wait_for_timeout(800)
             if opened:
                 break
             if rejected:
@@ -176,13 +182,13 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
         # widget to render first: builds can render the form several seconds
         # after the frame appears
         rendered = False
-        for _ in range(6):
+        for _ in range(12):
             if cf.query_selector("input[name=contact]"):
                 rendered = True
                 break
             if cf.query_selector("input[type=radio]"):
                 break
-            pg.wait_for_timeout(2000)
+            pg.wait_for_timeout(900)
         if not (rendered or cf.query_selector("input[type=radio]")):
             raise _WalkFail({"status": "SITE_FAIL", "response": "checkout did not open", "site": site, "raw": ""})
         # type phone and advance — verify the widget actually left the contact
@@ -194,27 +200,15 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
                 cf.click("input[name=contact]", timeout=4000)
                 cur = cf.evaluate("() => { const e = document.querySelector('input[name=contact]'); return e ? e.value : ''; }")
                 if not cur:
-                    cf.type("input[name=contact]", phone, delay=40)
+                    cf.type("input[name=contact]", phone, delay=30)
                 try:
                     cf.evaluate("() => { for (const bt of document.querySelectorAll('button')) if ((bt.textContent||'').trim() === 'Continue') { bt.click(); break; } }")
                 except Exception:
                     cf.click("button:has-text('Continue')", timeout=5000)
             except Exception:
                 pass
-            pg.wait_for_timeout(6000)
+            pg.wait_for_timeout(2000)
 
-        try:
-            _dbg = cf.evaluate("""() => {
-                const out = {inputs: [], buttons: [], radios: 0};
-                for (const e of document.querySelectorAll('input')) if (e.offsetWidth) out.inputs.push((e.name || e.type) + '=' + (e.value||'').slice(0,18));
-                for (const e of document.querySelectorAll('button')) if (e.offsetParent) out.buttons.push((e.textContent||'').trim().slice(0,20));
-                for (const e of document.querySelectorAll('input[type=radio]')) if (e.offsetWidth) out.radios++;
-                return out;
-            }""")
-            print("STAGE state:", json.dumps(_dbg)[:400], "frame:", cf.url[:80], flush=True)
-        except Exception as _de:
-            print("STAGE state EXC:", type(_de).__name__, flush=True)
-        print("STAGE contact-done", flush=True)
         # card method — method list may still be rendering
         for _ in range(4):
             picked = cf.evaluate(r"""() => {
@@ -229,29 +223,15 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
                 }
                 return false;
             }""")
-            print("STAGE radio try picked=", picked, flush=True)
             if picked:
                 break
-            try:
-                _rd = cf.evaluate("""() => {
-                    const out = [];
-                    for (const r of document.querySelectorAll('input[type=radio]')) {
-                        const e0 = r.parentElement;
-                        out.push({vis: !!r.offsetWidth, t0: e0 ? (e0.textContent||'').trim().slice(0,20) : null});
-                    }
-                    return out;
-                }""")
-                print("STAGE radios:", json.dumps(_rd)[:300], flush=True)
-            except Exception as _re2:
-                print("STAGE radios EXC:", type(_re2).__name__, flush=True)
-            pg.wait_for_timeout(2000)
-        pg.wait_for_timeout(4000)
-        print("STAGE radio-done", flush=True)
+            pg.wait_for_timeout(1000)
+        pg.wait_for_timeout(1500)
         # card form — type digits, let checkout.js format them
         num_sel = None
         for sel in ("input[name='card.number']", "input[name='card[number]']"):
             try:
-                cf.wait_for_selector(sel, timeout=8000)
+                cf.wait_for_selector(sel, timeout=3500)
                 num_sel = sel
                 break
             except Exception:
@@ -274,7 +254,7 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
                 pg.wait_for_timeout(4000)
                 for sel in ("input[name='card.number']", "input[name='card[number]']"):
                     try:
-                        cf.wait_for_selector(sel, timeout=4000)
+                        cf.wait_for_selector(sel, timeout=2000)
                         num_sel = sel
                         break
                     except Exception:
@@ -283,35 +263,58 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
                     break
         if not num_sel:
             raise _WalkFail({"status": "SITE_FAIL", "response": "card form did not render", "site": site, "raw": ""})
-        print("STAGE numsel", num_sel, flush=True)
         dot = "card.number" in num_sel
         exp_sel = "input[name='card.expiry']" if dot else "input[name='card[expiry]']"
         cvv_sel = "input[name='card.cvv']" if dot else "input[name='card[cvv]']"
-        cf.click(num_sel)
-        cf.type(num_sel, card, delay=45)
-        # the widget's formatter can race the last keystroke and drop a digit —
-        # verify the value and repair via the native value setter
-        try:
-            cf.evaluate(r"""(c) => {
-                const el = document.querySelector("input[name='card.number']");
-                if (!el) return 'gone';
-                const have = (el.value||'').replace(/\D/g,'');
-                if (have.length === c.length) return 'ok';
-                const s = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                s.call(el, c);
-                el.dispatchEvent(new Event('input', {bubbles: true}));
-                return 'fixed';
-            }""", card)
-        except Exception:
-            pass
+
+        def type_number():
+            # the widget mounts its card form progressively — typing into it
+            # too early gets the value wiped by a rebuild; the formatter also
+            # drops fast keystrokes. Settle, type slowly, verify, retype.
+            for _ in range(3):
+                try:
+                    nf = cf.query_selector(num_sel)
+                    if not nf:
+                        pg.wait_for_timeout(600)
+                        continue
+                    nf.click()
+                    nf.type(card, delay=60)
+                    pg.wait_for_timeout(500)
+                    have = cf.evaluate("() => { const e = document.querySelector(\"input[name='card.number']\"); return e ? (e.value||'').replace(/\\D/g,'') : ''; }")
+                    if len(have) == len(card):
+                        return True
+                    # repair via native setter, then trusted retype
+                    cf.evaluate(r"""(c) => {
+                        const el = document.querySelector("input[name='card.number']");
+                        if (!el) return;
+                        const s = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        s.call(el, c);
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                    }""", card)
+                    pg.wait_for_timeout(400)
+                    have = cf.evaluate("() => { const e = document.querySelector(\"input[name='card.number']\"); return e ? (e.value||'').replace(/\\D/g,'') : ''; }")
+                    if len(have) == len(card):
+                        return True
+                    nf = cf.query_selector(num_sel)
+                    if nf:
+                        nf.click()
+                        pg.keyboard.press("Control+A")
+                        pg.keyboard.press("Delete")
+                        nf.type(card, delay=75)
+                        pg.wait_for_timeout(500)
+                except Exception:
+                    pass
+            return False
+        pg.wait_for_timeout(800)
+        type_number()
         try:
             cf.click(exp_sel)
-            cf.type(exp_sel, f"{mm}{yy[-2:]}", delay=70)
+            cf.type(exp_sel, f"{mm}{yy[-2:]}", delay=40)
         except Exception:
             pass
         try:
             cf.click(cvv_sel)
-            cf.type(cvv_sel, cvv, delay=45)
+            cf.type(cvv_sel, cvv, delay=25)
         except Exception:
             pass
         # name on card — required for some BINs (e.g. Mastercard); when the field
@@ -324,15 +327,16 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
                     vis = cf.evaluate("(e)=>!!(e.offsetWidth||e.offsetHeight)", nf)
                     if vis:
                         cf.click(nsel)
-                        cf.type(nsel, name, delay=30)
+                        cf.type(nsel, name, delay=20)
                         break
             except Exception:
                 continue
 
         def bind_name_email():
-            # JS value-setter fill: typing can fail to bind React state, which
-            # blocks the submit silently — verify-and-fill name + card email
-            for _ in range(3):
+            # the widget blocks the submit silently when name/card-email are
+            # empty — verify-and-fill via JS setter, falling back to trusted
+            # keystroke typing (the controlled input can reject synthetic sets)
+            for _ in range(4):
                 try:
                     vals = cf.evaluate(r"""() => {
                         const nm = document.querySelector("input[name='card.name']");
@@ -357,11 +361,42 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
                     }""", name, email)
                 except Exception:
                     return
-                pg.wait_for_timeout(600)
+                pg.wait_for_timeout(400)
+                # still empty → trusted keystroke typing
+                try:
+                    vals = cf.evaluate(r"""() => {
+                        const nm = document.querySelector("input[name='card.name']");
+                        const em = document.querySelector("input[name='email']");
+                        return {n: nm ? nm.value : "", e: em ? em.value : ""};
+                    }""")
+                    if not vals.get("n"):
+                        nmh = cf.query_selector("input[name='card.name']")
+                        if nmh:
+                            nmh.click()
+                            nmh.type(name, delay=35)
+                    if not vals.get("e") and cf.query_selector("input[name='email']"):
+                        emh = cf.query_selector("input[name='email']")
+                        if emh:
+                            emh.click()
+                            emh.type(email, delay=35)
+                except Exception:
+                    pass
         bind_name_email()
-        pg.wait_for_timeout(1000)
+        pg.wait_for_timeout(400)
 
         def click_submit():
+            # trusted playwright click first — new widget builds ignore
+            # synthetic JS clicks on the card-form submit
+            try:
+                cf.click("button:has-text('Pay')", timeout=2000)
+                return 'pay'
+            except Exception:
+                pass
+            try:
+                cf.click("button:has-text('Continue')", timeout=2000)
+                return 'continue'
+            except Exception:
+                pass
             return cf.evaluate(r"""() => {
                 const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent && !b.disabled);
                 for (const bt of btns) { const t=(bt.textContent||'').trim(); if (/^pay/i.test(t)) { bt.click(); return 'pay'; } }
@@ -384,12 +419,10 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
 
         # 1st submit — card form Continue (opens the DCC step for foreign BINs)
         try:
-            _sub = click_submit()
-            print("STAGE submit ret:", _sub, flush=True)
-        except Exception as _e:
-            _sub = None
-            print("STAGE submit EXC:", type(_e).__name__, flush=True)
-        pg.wait_for_timeout(4000)
+            click_submit()
+        except Exception:
+            pass
+        pg.wait_for_timeout(2000)
         try:
             _st = cf.evaluate("""() => {
                 const out = {btns: [], inputs: [], texts: []};
@@ -399,39 +432,8 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
                 out.texts = [...new Set(out.texts)].slice(0,5);
                 return out;
             }""")
-            print("STAGE post-submit:", json.dumps(_st)[:600], flush=True)
-        except Exception as _se:
-            print("STAGE post-submit EXC:", type(_se).__name__, flush=True)
-        # the first Continue can be silently blocked when the card email is
-        # empty (guest checkout) — re-bind and re-submit once
-        if cf.query_selector("input[name='card.number']"):
-            bind_name_email()
-            try:
-                _sub2 = click_submit()
-                print("STAGE resubmit ret:", _sub2, flush=True)
-            except Exception:
-                pass
-            pg.wait_for_timeout(4000)
-        for _ns in range(2):
-            _txts = json.dumps(_st.get("texts", [])) if isinstance(_st, dict) else ""
-            if "name on your card" not in _txts.lower() and "email" not in _txts.lower():
-                break
-            bind_name_email()
-            pg.wait_for_timeout(800)
-            try:
-                click_submit()
-            except Exception:
-                pass
-            pg.wait_for_timeout(4000)
-            try:
-                _st = cf.evaluate("""() => {
-                    const out = [];
-                    for (const e of document.querySelectorAll('div,span,p')) { const t=(e.textContent||'').trim(); if (t && t.length<90 && e.offsetParent && /valid|invalid|error|enter|required|declin|failed|exceed/i.test(t)) out.push(t.slice(0,60)); }
-                    return [...new Set(out)].slice(0,5);
-                }""")
-                print("STAGE re-submit texts:", json.dumps(_st)[:300], flush=True)
-            except Exception:
-                break
+        except Exception:
+            _st = None
 
         # interactive dance until create/ajax answers: DCC "Pay ..." → verify
         # payment address modal (country/state are full-picker modals) → RBI
@@ -442,57 +444,72 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
                               ("postal_code", args.get("zip") or "1000")):
                 try:
                     cf.click(f"input[name={name}]", timeout=3000)
-                    cf.type(f"input[name={name}]", val, delay=25)
-                    pg.wait_for_timeout(300)
+                    cf.type(f"input[name={name}]", val, delay=20)
+                    pg.wait_for_timeout(200)
                 except Exception:
                     pass
             # country: opens a full picker modal — search + click the row
             ctry = (args.get("addr_country") or "azerbaijan").lower()
             try:
                 cf.click("input[name=country]", timeout=3000)
-                pg.wait_for_timeout(1500)
+                pg.wait_for_timeout(1200)
                 cf.fill("input[placeholder*='Search for a country']", ctry)
-                pg.wait_for_timeout(1500)
+                pg.wait_for_timeout(1200)
                 cf.evaluate("(c) => { const rows = [...document.querySelectorAll('div,button,li')].filter(e => e.offsetParent && !e.querySelector('div,button,li') && e.textContent.trim().toLowerCase() === c); if (rows.length) rows[0].click(); return rows.length; }", ctry)
-                pg.wait_for_timeout(2000)
+                pg.wait_for_timeout(1500)
             except Exception:
                 pass
             # state: picker/type after country is set
             st = (args.get("addr_state") or "baku").lower()
             try:
                 cf.click("input[name=state]", timeout=3000)
-                cf.type("input[name=state]", st, delay=25)
-                pg.wait_for_timeout(1200)
+                cf.type("input[name=state]", st, delay=20)
+                pg.wait_for_timeout(800)
                 cf.evaluate("(s) => { const rows = [...document.querySelectorAll('div,button,li')].filter(e => e.offsetParent && !e.querySelector('div,button,li') && e.textContent.trim().toLowerCase().startsWith(s) && e.textContent.length < 50); if (rows.length) rows[0].click(); return rows.length; }", st)
             except Exception:
                 pass
-            pg.wait_for_timeout(1000)
+            pg.wait_for_timeout(600)
             # modal Continue — last visible one
             cf.evaluate("() => { const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent && !b.disabled && (b.textContent||'').trim() === 'Continue'); if (btns.length) btns[btns.length-1].click(); }")
 
         verdict = None
         saw_ajax_err = False
         addr_done = False
-        deadline = time.time() + 30
+        _ns = 0
+        _dlog = []
+        deadline = time.time() + 22
         while time.time() < deadline and verdict is None:
-            pg.wait_for_timeout(2500)
+            pg.wait_for_timeout(1200)
             kind, res = parse_hits(api_hits)
             if kind == "VERDICT":
                 verdict = res
                 break
             if kind == "SERVER_ERR":
                 server_errs += 1
+                # razorpay server incident — final for this walk, fail fast
+                saw_ajax_err = True
+                break
             if kind == "AJAX_SERVER_ERR":
                 saw_ajax_err = True
+                # fail fast — razorpay's server incident is the final answer for
+                # this walk; further polling wastes 20s and never clears it
+                break
             if kind == "GATEWAY_CONN_ERR":
                 # gateway↔issuer network failure — retry with a fresh session
                 raise _WalkFail({"status": "SITE_FAIL", "response": "gateway connection error", "site": site, "raw": ""})
+            try:
+                _dlog.append({"cf": cf.query_selector("input[name='card.number']") is not None,
+                              "pay": bool(cf.evaluate("() => { const btns=[...document.querySelectorAll('button')].filter(b=>b.offsetParent&&!b.disabled); for (const bt of btns) { const t=(bt.textContent||'').trim(); if (/^pay/i.test(t)) return 1; } return 0; }") if True else 0),
+                              "dcc": bool(cf.query_selector("input[name=dccCurrencyOption]")),
+                              "ns": _ns, "saw": saw_ajax_err})
+            except Exception:
+                pass
             # DCC pay button (trusted click required)
             try:
                 has_pay = cf.evaluate("() => { const btns=[...document.querySelectorAll('button')].filter(b=>b.offsetParent&&!b.disabled); for (const bt of btns) { const t=(bt.textContent||'').trim(); if (/^pay/i.test(t)) return 1; } return 0; }")
                 if has_pay:
                     real_click()
-                    pg.wait_for_timeout(3000)
+                    pg.wait_for_timeout(1500)
                     continue
             except Exception:
                 pass
@@ -502,7 +519,9 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
                 if has_addr and not addr_done:
                     handle_address()
                     addr_done = True
-                    pg.wait_for_timeout(3000)
+                    # the picker modal + RBI step need extra wall-clock
+                    deadline = max(deadline, time.time() + 14)
+                    pg.wait_for_timeout(1500)
                     continue
             except Exception:
                 pass
@@ -510,18 +529,44 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
             try:
                 rbi = cf.evaluate("() => { const btns=[...document.querySelectorAll('button')].filter(b=>b.offsetParent); for (const bt of btns) { const t=(bt.textContent||'').trim(); if (/maybe later/i.test(t)) { bt.click(); return 1; } } return 0; }")
                 if rbi:
-                    pg.wait_for_timeout(3000)
+                    pg.wait_for_timeout(1500)
                     continue
             except Exception:
                 pass
+            # still on the card form — the first Continue can be silently
+            # blocked (empty card email, unbound fields): re-bind + re-submit
+            if _ns < 2 and cf.query_selector("input[name='card.number']"):
+                _ns += 1
+                bind_name_email()
+                try:
+                    click_submit()
+                except Exception:
+                    pass
+                pg.wait_for_timeout(2000)
+                continue
+
+        print("DANCE-LOG:", json.dumps(_dlog)[:700], file=sys.stderr, flush=True)
+        try:
+            _dz = cf.evaluate(r"""() => {
+                const out = {btns: [], inputs: [], texts: []};
+                for (const e of document.querySelectorAll('button')) if (e.offsetParent) out.btns.push((e.textContent||'').trim().slice(0,25));
+                for (const e of document.querySelectorAll('input')) if (e.offsetWidth) out.inputs.push((e.name||e.type)+'='+(e.value||'').slice(0,12));
+                for (const e of document.querySelectorAll('div,span,p,h2,h3,label')) { const t=(e.textContent||'').trim(); if (t && t.length<60 && e.offsetParent && e.children.length===0) out.texts.push(t.slice(0,40)); }
+                out.texts = [...new Set(out.texts)].slice(0,14);
+                const cb = document.querySelector("button:disabled");
+                out.disabled = cb ? (cb.textContent||'').trim().slice(0,20) : null;
+                return out;
+            }""")
+            print("DANCE-END:", json.dumps(_dz)[:500], file=sys.stderr, flush=True)
+        except Exception as _dze:
+            print("DANCE-END EXC:", type(_dze).__name__, file=sys.stderr, flush=True)
 
         if verdict:
             return verdict, server_errs
         if saw_ajax_err:
-            # razorpay's server fails payment creation for this card — deterministic
-            # across fresh sessions/currencies/amounts; typically an unsupported BIN
+            # razorpay's server incident is the final answer for this card
             return {"status": "DECLINED",
-                    "response": "Payment creation failed — Razorpay SERVER_ERROR (card BIN not supported by Razorpay)",
+                    "response": "The server encountered an error. The incident has been reported to admins.",
                     "raw": ""}, server_errs
 
         # fall back to visible widget text

@@ -451,7 +451,7 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
               # mid-walk ("Gateway Connection Error") — each retry takes a fresh
               # proxy; wall-clock guard keeps us inside the 280s budget
               for attempt_no in (1, 2, 3):
-                  if attempt_no > 1 and time.time() - walker_t0 > 120:
+                  if attempt_no > 1 and time.time() - walker_t0 > 90:
                       break
                   print(f"[RZWALK] enter site={site} attempt={attempt_no} t={time.time()-walker_t0:.0f}s", flush=True)
                   args = {"site": site, "card": cc, "mm": mm, "yy": str(year_full), "cvv": cvv,
@@ -474,14 +474,18 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
                           stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                       )
                       try:
-                          out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=140)
+                          out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=100)
                       except (asyncio.TimeoutError, Exception):
                           try:
                               proc.kill()
                           except Exception:
                               pass
                           raise
-                      data = json.loads(out_b.decode(errors="ignore"))
+                      out_s = out_b.decode(errors="ignore").strip()
+                      _cand = out_s
+                      if not _cand.startswith("{"):
+                          _cand = next((ln.strip() for ln in reversed(out_s.splitlines()) if ln.strip().startswith("{")), out_s)
+                      data = json.loads(_cand)
                   except Exception as e:
                       print(f"[RZWALK] attempt={attempt_no} subprocess EXC: {type(e).__name__}", flush=True)
                       break
@@ -491,11 +495,6 @@ async def check_razorpay(cc: str, mm: str, yy: str, cvv: str, proxy: str = None,
                         f"proxy={args.get('proxy_server')} status={data.get('status')} "
                         f"resp={str(data.get('response'))[:80]}", flush=True)
                   st = str(data.get("status", "")).upper()
-                  # Razorpay's create/ajax SERVER_ERROR is intermittent per
-                  # session — not a card verdict; retry the walk on a fresh proxy
-                  if st == "DECLINED" and "SERVER_ERROR" in str(data.get("response", "")).upper():
-                      last_walker_resp = f"{site}: {data.get('response', '')}"
-                      continue
                   if st in ("APPROVED", "DECLINED", "REQUIRES_ACTION"):
                       resp_text = str(data.get("response") or "Payment failed")
                       result.update(status=st, message=resp_text, response=resp_text,
