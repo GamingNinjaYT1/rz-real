@@ -126,7 +126,10 @@ def walk_once(p, args, site, card, mm, yy, cvv, phone, email, name):
         opened = False
         cf = None
         for _open_try in range(3):
-            pg.goto(site, timeout=60000, wait_until="domcontentloaded")
+            try:
+                pg.goto(site, timeout=60000, wait_until="domcontentloaded")
+            except Exception:
+                raise _WalkFail({"status": "SITE_FAIL", "response": "payment page did not load", "site": site, "raw": ""})
             pg.wait_for_timeout(1500)
             amt = pg.query_selector("input[type=number]")
             pay_btn = pg.query_selector("input[type=button]")
