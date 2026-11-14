@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 ENV PORT=10000
+ENV JIO_LOG_FILE=/tmp/jio_hits.csv
 EXPOSE 10000
 
 CMD ["python", "rz_api_server.py"]
