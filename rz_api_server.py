@@ -113,15 +113,22 @@ _PP_FIELDS = ("client_id", "client_secret", "amount",
               "firstName", "lastName", "email",
               "address1", "city", "state", "zip", "country")
 
-def _pp_out(cc, res, amount, t0, include_debug):
+def _pp_out(cc, res, amount, t0, include_debug, proxy_raw=""):
     status = str(res.get("status", "ERROR")).upper()
+    amount_s = str(amount or "1.00")
+    try:
+        amount_s = str(float(amount_s)).rstrip("0").rstrip(".") or "0"
+    except Exception:
+        pass
+    px = (proxy_raw or "").strip()
+    ip = px.split("@")[-1].split(":")[0] if "@" in px else (px or "direct")
     out = {
         "cc": cc, "Gateway": "PayPal Key [1$]",
         "Status": status,
         "Response": str(res.get("response", ""))[:70],
-        "Price": amount or "1.00",
+        "Price": amount_s,
         "Currency": "USD",
-        "IP": "64.4.168.78",
+        "IP": ip,
         "timetaken": f"{time.time()-t0:.1f}s",
     }
     if include_debug:
@@ -142,10 +149,11 @@ def _pp_run(runner, cc):
     t0 = time.time()
     parts = cc.split("|")
     kwargs = _pp_kwargs()
-    kwargs["proxy_str"] = normalize_proxy(request.args.get("proxy", ""))
+    proxy_raw = request.args.get("proxy", "")
+    kwargs["proxy_str"] = normalize_proxy(proxy_raw)
     res = runner(parts[0], parts[1].zfill(2), parts[2][-2:], parts[3], **kwargs)
     dbg = request.args.get("debug", "").lower() in ("yes", "1", "true")
-    return _pp_out(cc, res, kwargs.get("amount"), t0, dbg)
+    return _pp_out(cc, res, kwargs.get("amount"), t0, dbg, proxy_raw)
 
 def _normalize_proxy_render(raw):
     raw = (raw or "").strip()
