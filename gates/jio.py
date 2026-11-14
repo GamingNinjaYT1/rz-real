@@ -468,6 +468,63 @@ def _log_result(number: str, masked: str, result: dict, reason_code: str = ""):
 
 
 
+
+
+def _browser_pay(gl_token: str, card: dict, proxy: Optional[str],
+                 fallback_amt, debug: bool = False) -> Optional[dict]:
+    """Run the payglocal payment in a real chromium via subprocess.
+    Returns verdict dict, or None if the browser leg is unavailable."""
+    import subprocess, shutil as _sh
+    if os.environ.get("JIO_PAY_BROWSER", "1") == "0":
+        return None
+    py = os.environ.get("JIO_BROWSER_PYTHON", "/usr/bin/python3")
+    if not os.path.exists(py):
+        return None
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jio_browser_pay.py")
+    if not os.path.exists(script):
+        return None
+    px = proxy or ""
+    try:
+        from curl_cffi import requests as _c
+        s = _c.Session()
+        r = s.get("https://api.ipify.org", proxies={"http": px, "https": px} if px else None,
+                  timeout=10)
+        _ = r.text
+    except Exception:
+        pass
+    # payglocal's CF blocks the resi proxy ranges — the pay leg goes direct
+    # (JIO_PG_PROXY can override with a specific clean proxy for this leg)
+    payload = json.dumps({"token": gl_token, "cc": card.get("cc", ""),
+                          "mm": card.get("mm", ""), "yy": card.get("yy", ""),
+                          "cvv": card.get("cvv", ""),
+                          "proxy": os.environ.get("JIO_PG_PROXY", ""),
+                          "timeout": 85})
+    try:
+        r = subprocess.run([py, script], input=payload, capture_output=True,
+                           text=True, timeout=100)
+        line = ""
+        for ln in reversed((r.stdout or "").strip().splitlines()):
+            if ln.strip().startswith("{"):
+                line = ln.strip()
+                break
+        if not line:
+            if debug:
+                print(f"  [browser-pay] no output: rc={r.returncode} err={(r.stderr or '')[-200:]}", flush=True)
+            return None
+        res = json.loads(line)
+        if debug:
+            print(f"  [browser-pay] {res}", flush=True)
+        return res
+    except subprocess.TimeoutExpired:
+        if debug:
+            print("  [browser-pay] subprocess timeout", flush=True)
+        return {"status": "error", "response": "payflow browser timeout", "reason": "", "amount": ""}
+    except Exception as e:
+        if debug:
+            print(f"  [browser-pay] error {type(e).__name__}: {e}", flush=True)
+        return None
+
+
 def _run_jio(number: str, card: dict, amount: float,
              proxy: Optional[str] = None,
              debug: bool = False) -> Tuple[dict, str]:
@@ -859,6 +916,24 @@ def _run_jio(number: str, card: dict, amount: float,
         gateway = "payglocal"
         gl_token = m_gl.group(1)
 
+        if os.environ.get("JIO_TOKEN_ONLY"):
+            return _resp("error", gl_token, number, masked, gate=gateway), ""
+
+        # ── payglocal leg via real browser (CF blocks non-browser clients) ──
+        real_amt, src = _pick_real_amount(found_amounts, plan_amount)
+        bres = _browser_pay(gl_token, card, proxy, real_amt, debug=debug)
+        if bres is not None:
+            extra = {"amount_source": src} if debug else {}
+            if debug:
+                extra["debug_trace"] = found_amounts
+            if debug:
+                extra["browser_pay_raw"] = bres
+            return _resp(bres.get("status", "error"),
+                         bres.get("response", "api error"),
+                         number, masked,
+                         amount=bres.get("amount") or real_amt,
+                         plan=plan_name, gate="payglocal",
+                         **extra), bres.get("reason", "")
 
         jwt_pay = _jwt_payload(gl_token)
         if jwt_pay:
@@ -927,14 +1002,21 @@ def _run_jio(number: str, card: dict, amount: float,
                          "visitorId": "Y8c4sEunqz0opl0b6YAd",
                          "visitorFound": True, "confidenceScore": 1})
         try:
-            _scan_json_for_amounts(r14.json(), "r14_json", found_amounts)
+            j14 = r14.json()
+            _scan_json_for_amounts(j14, "r14_json", found_amounts)
         except Exception:
-            pass
-        kid = r14.json().get("data", {}).get("kid", "")
+            j14 = {}
+        kid = (j14.get("data") or {}).get("kid", "")
         print(f"  kid: {kid}", flush=True)
         if not kid:
             real_amt, src = _pick_real_amount(found_amounts, plan_amount)
             extra = {"amount_source": src} if debug else {}
+            if debug:
+                extra["r12_status"] = r12.status_code
+                extra["r13_status"] = r13.status_code
+                extra["r14_status"] = r14.status_code
+                extra["r14_headers"] = dict(list(r14.headers.items())[:8])
+                extra["r14_body"] = (r14.text or "")[:1500]
             if debug:
                 extra["debug_trace"] = found_amounts
             return _resp("error", "api error", number, masked,

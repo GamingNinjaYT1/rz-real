@@ -198,7 +198,8 @@ def pp_cvv():
 
 
 # ─── Jio / PayGlocal lane (gates.jio = standalone jio2 engine) ───
-_jio_exec = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+_jio_exec = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+_jio_lock = threading.Lock()
 
 @app.route("/jio")
 def jio_check():
@@ -229,6 +230,18 @@ def jio_check():
         return jsonify({"error": f"card brand not supported ({brand['brand']}) — visa/mastercard/amex only"}), 400
 
     result, _reason = None, ""
+    _jio_lock.acquire()
+    try:
+        return _jio_run_attempts(number, amount_f, card, proxy_raw, debug, t0, cc_raw)
+    finally:
+        _jio_lock.release()
+
+def _jio_run_attempts(number, amount_f, card, proxy_raw, debug, t0, cc_raw):
+    from gates.jio import (_run_jio, _parse_card, _detect_brand, _mask,
+                           SUPPORTED_BRANDS, MAX_RETRIES,
+                           RETRY_DELAY_MIN, RETRY_DELAY_MAX)
+    import random as _rnd
+    result, _reason = None, ""
     for attempt in range(1, MAX_RETRIES + 2):
         if attempt > 1:
             time.sleep(_rnd.uniform(RETRY_DELAY_MIN, RETRY_DELAY_MAX))
@@ -238,6 +251,10 @@ def jio_check():
         except concurrent.futures.TimeoutError:
             fut.cancel()
             result = {"status": "error", "response": "Timeout (plan lookup stuck)",
+                      "amount": amount_f, "gate": "unknown"}
+            break
+        except Exception as e:
+            result = {"status": "error", "response": f"Internal error: {type(e).__name__}",
                       "amount": amount_f, "gate": "unknown"}
             break
         if result["status"] != "error":
@@ -254,7 +271,7 @@ def jio_check():
     out = {
         "cc": cc_raw, "Gateway": gateway,
         "Status": st,
-        "Response": str(result.get("response", ""))[:70],
+        "Response": str(result.get("response", "")),
         "Price": amt_s,
         "Currency": "INR",
         "IP": proxy_raw.split("@")[-1].split(":")[0] if "@" in proxy_raw else (proxy_raw or "direct"),
