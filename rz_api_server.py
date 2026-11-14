@@ -282,5 +282,45 @@ def _jio_run_attempts(number, amount_f, card, proxy_raw, debug, t0, cc_raw):
     return jsonify(out)
 
 
+
+
+# ─── Stripe Auth lane (token check via gates.hsin_stripe_auth) ───
+def process_stripe_auth(cc, mm, yy, cvv, proxy_str=None):
+    from gates.hsin_stripe_auth.checker import check_stripe_auth
+    fut = asyncio.run_coroutine_threadsafe(
+        check_stripe_auth(cc, mm, yy, cvv, proxy=proxy_str or None),
+        _loop
+    )
+    return fut.result(timeout=90)
+
+@app.route("/stripeauth")
+def stripe_auth_check():
+    cc = request.args.get("cc", "")
+    proxy = request.args.get("proxy", "").strip()
+    if not cc or "|" not in cc:
+        return jsonify({"error": "missing or invalid cc — use /stripeauth?cc=<card|mm|yy|cvv>&proxy=<optional>"}), 400
+    parts = cc.split("|")
+    _cc, _mm, _yy, _cvv = parts[0], parts[1].zfill(2), parts[2][-2:] if len(parts[2]) == 4 else parts[2], parts[3]
+    t0 = time.time()
+    try:
+        res = process_stripe_auth(_cc, _mm, _yy, _cvv, proxy)
+    except concurrent.futures.TimeoutError:
+        return jsonify({"error": "stripe auth timed out"}), 504
+    except Exception as e:
+        return jsonify({"error": f"internal error: {type(e).__name__}"}), 500
+    status = str(res.get("status", "ERROR")).upper()
+    response = str(res.get("response") or res.get("message") or "Unknown")
+    return jsonify({
+        "cc": cc,
+        "Gateway": "Stripe Auth",
+        "Status": status,
+        "Response": response,
+        "Price": "0",
+        "Currency": "USD",
+        "IP": proxy.split("@")[-1].split(":")[0] if "@" in proxy else (proxy or "direct"),
+        "timetaken": f"{time.time()-t0:.1f}s",
+    })
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5003)), debug=False)
