@@ -67,6 +67,7 @@ def razorpay_check():
         status = str(res.get("status", "ERROR")).upper()
         response = str(res.get("response") or res.get("message") or "Unknown")
 
+        _record("razorpay-135-1", status, time.time()-t0)
         return jsonify({
             "cc": cc,
             "Gateway": "Razorpay ₹1",
@@ -145,7 +146,7 @@ def _pp_kwargs():
     kwargs.setdefault("amount", "1.00")
     return kwargs
 
-def _pp_run(runner, cc):
+def _pp_run(runner, cc, gate="pp"):
     t0 = time.time()
     parts = cc.split("|")
     kwargs = _pp_kwargs()
@@ -153,7 +154,7 @@ def _pp_run(runner, cc):
     kwargs["proxy_str"] = normalize_proxy(proxy_raw)
     res = runner(parts[0], parts[1].zfill(2), parts[2][-2:], parts[3], **kwargs)
     dbg = request.args.get("debug", "").lower() in ("yes", "1", "true")
-    return _pp_out(cc, res, kwargs.get("amount"), t0, dbg, proxy_raw)
+    _r = _pp_out(cc, res, kwargs.get("amount"), t0, dbg, proxy_raw); _record(gate, _r.get("Status"), time.time()-t0); return _r
 
 def _normalize_proxy_render(raw):
     raw = (raw or "").strip()
@@ -176,7 +177,7 @@ def pp_check():
     cc = request.args.get("cc", "").strip()
     if not cc or "|" not in cc:
         return jsonify({"error": "missing or invalid cc — format CC|MM|YY|CVV"}), 400
-    return jsonify(_pp_run(run_check, cc))
+    return jsonify(_pp_run(run_check, cc, gate="pp"))
 
 @app.route("/ppdirect")
 def pp_direct():
@@ -184,7 +185,7 @@ def pp_direct():
     cc = request.args.get("cc", "").strip()
     if not cc or "|" not in cc:
         return jsonify({"error": "cc=CC|MM|YY|CVV"}), 400
-    return jsonify(_pp_run(run_check, cc))
+    return jsonify(_pp_run(run_check, cc, gate="pp"))
 
 @app.route("/ppcvv")
 def pp_cvv():
@@ -192,7 +193,7 @@ def pp_cvv():
     cc = request.args.get("cc", "").strip()
     if not cc or "|" not in cc:
         return jsonify({"error": "cc=CC|MM|YY|CVV"}), 400
-    return jsonify(_pp_run(run_paypal_check, cc))
+    return jsonify(_pp_run(run_paypal_check, cc, gate="ppcvv"))
 
 
 
@@ -268,6 +269,7 @@ def _jio_run_attempts(number, amount_f, card, proxy_raw, debug, t0, cc_raw):
         amt_s = str(float(amt)).rstrip("0").rstrip(".") or "0"
     except Exception:
         amt_s = str(amt or amount)
+    _record("jio", st, time.time()-t0)
     out = {
         "cc": cc_raw, "Gateway": gateway,
         "Status": st,
@@ -310,6 +312,7 @@ def stripe_auth_check():
         return jsonify({"error": f"internal error: {type(e).__name__}"}), 500
     status = str(res.get("status", "ERROR")).upper()
     response = str(res.get("response") or res.get("message") or "Unknown")
+    _record("stripeauth", status, time.time()-t0)
     return jsonify({
         "cc": cc,
         "Gateway": "Stripe Auth",
@@ -344,6 +347,7 @@ def sa_check():
         return jsonify({"error": f"internal error: {type(e).__name__}"}), 500
     status = str(res.get("status", "ERROR")).upper()
     response = str(res.get("response") or "Unknown")
+    _record("sa", status, time.time()-t0)
     return jsonify({
         "cc": cc,
         "Gateway": "Stripe Auth",
@@ -359,6 +363,74 @@ def _sa_run(cc):
     from gates.stripeauth_sites import process_stripe_auth as _psa
     import asyncio as _aio
     return _aio.run(_psa(cc))
+
+
+
+
+# ─── Xonic Unified Gateway — root listing + per-gate health tracking ───
+from collections import deque as _dq
+
+_GATE_STATS = {
+    "razorpay-135-1": _dq(maxlen=50),
+    "pp": _dq(maxlen=50),
+    "ppdirect": _dq(maxlen=50),
+    "ppcvv": _dq(maxlen=50),
+    "jio": _dq(maxlen=50),
+    "stripeauth": _dq(maxlen=50),
+    "sa": _dq(maxlen=50),
+}
+_stats_lock = threading.Lock()
+
+def _record(gate, status, tt):
+    with _stats_lock:
+        _GATE_STATS[gate].append((str(status).upper(), float(tt)))
+
+def _health(gate):
+    with _stats_lock:
+        rows = list(_GATE_STATS[gate])
+    if not rows:
+        return None
+    ok = sum(1 for s, _ in rows if s in ("APPROVED", "CHARGED", "REQUIRES_ACTION", "DECLINED", "INVALID"))
+    return round(100.0 * ok / len(rows), 1)
+
+@app.route("/")
+def xonic_root():
+    gates = [
+        ("Razorpay ₹1 (walker)",   "/razorpay-135-1", "INR"),
+        ("PayPal Key",             "/pp",             "USD"),
+        ("PayPal Key (key override)", "/ppdirect",    "USD"),
+        ("PayPal CVV",             "/ppcvv",          "USD"),
+        ("Jio PayGlocal",          "/jio",            "INR"),
+        ("Stripe Auth (token)",    "/stripeauth",     "USD"),
+        ("Stripe Auth (site)",     "/sa",             "USD"),
+    ]
+    out = []
+    for name, ep, cur in gates:
+        key = ep.lstrip("/")
+        rows = _GATE_STATS[key]
+        h = _health(key)
+        out.append({
+            "gate": name,
+            "endpoint": ep,
+            "currency": cur,
+            "health": (f"{h}%" if h is not None else "N/A (no checks yet)"),
+            "checks": len(rows),
+        })
+    return jsonify({
+        "gateway": "Xonic Unified Gateway",
+        "version": "1.0",
+        "gates": len(out),
+        "usage": {
+            "razorpay": "/razorpay-135-1?cc=card|mm|yy|cvv&proxy=http://user:pass@host:port&site=@handle|url",
+            "paypal":   "/pp?cc=card|mm|yy|cvv&proxy=http://user:pass@host:port",
+            "paypal_direct": "/ppdirect?cc=card|mm|yy|cvv[&client_id=&client_secret=&amount=]",
+            "paypal_cvv": "/ppcvv?cc=card|mm|yy|cvv&proxy=...",
+            "jio":      "/jio?jio=<10-digit>&amount=<plan-price>&cc=card|mm|yy|cvv&proxy=...",
+            "stripeauth": "/stripeauth?cc=card|mm|yy|cvv",
+            "sa":       "/sa?cc=card|mm|yy|cvv",
+        },
+        "list": out,
+    })
 
 
 if __name__ == "__main__":
