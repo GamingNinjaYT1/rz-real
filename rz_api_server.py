@@ -441,37 +441,52 @@ def _sh2_run(cc, site, proxy, variant):
     cands = [{"id": info["variant_id"], "price": float(info.get("price") or 0)}]
     cands += [c for c in (info.get("candidates") or []) if c["id"] not in tried]
 
+    ROTATE_MARKERS = ("PAYMENTS_POSITIVE_AMOUNT_EXPECTED", "DIGITAL_PRODUCT_CHURN", "VALIDATION_CUSTOM")
     last = (False, "Unknown", "UNKNOWN", "0", "USD")
-    idx = 0
-    while idx < len(cands) and idx < 6:
-        cand = cands[idx]
-        if cand["id"] in tried:
-            idx += 1
+
+    # rotation runs in parallel batches of 3 — total rotation latency stays ~one
+    # check round (~15s) instead of N sequential rounds
+    batches = [cands[i:i+3] for i in range(0, min(len(cands), 6), 3)]
+    floor_need = None
+    for batch in batches:
+        to_run = [c for c in batch if c["id"] not in tried]
+        if not to_run:
             continue
-        tried.add(cand["id"])
-        res = _aio.run(_sh2pc(ccn, mm, yy, cvv, site, cand["id"], proxy or None))
-        last = res
-        msg = str(res[1])
-        if "PAYMENTS_POSITIVE_AMOUNT_EXPECTED" in msg or "DIGITAL_PRODUCT_CHURN" in msg:
-            idx += 1
+        for c in to_run:
+            tried.add(c["id"])
+        try:
+            coros = [_sh2pc(ccn, mm, yy, cvv, site, c["id"], proxy or None) for c in to_run]
+
+            async def _batch():
+                return await _aio.gather(*coros, return_exceptions=True)
+
+            results = _aio.run(_batch())
+        except Exception:
             continue
-        if "VALIDATION_CUSTOM" in msg:
-            # store rule (e.g. "less than the $12.00 minimum") — deep-search the catalog
-            # for a variant priced above the store's minimum, then check that
-            _mm = re.search(r"\$([0-9][0-9.,]*)", msg)
-            if _mm:
-                try:
-                    need = float(_mm.group(1).replace(",", ""))
-                except ValueError:
-                    return res
-                try:
-                    info2 = _aio.run(_sfp(site_url, proxy or None, price_floor=need))
-                except Exception:
-                    return res
-                if isinstance(info2, dict) and info2.get("variant_id"):
-                    return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, info2["variant_id"], proxy or None))
-            return res
-        return res
+        for res in results:
+            if isinstance(res, tuple):
+                last = res
+        # first real verdict wins
+        for res in results:
+            if isinstance(res, tuple) and not any(m in str(res[1]) for m in ROTATE_MARKERS):
+                return res
+        # all candidates in this batch rotated — check for a minimum-order rule and
+        # deep-search the catalog for a variant above it
+        for res in results:
+            if isinstance(res, tuple) and "VALIDATION_CUSTOM" in str(res[1]):
+                _mm = re.search(r"\$([0-9][0-9.,]*)", str(res[1]))
+                if _mm:
+                    try:
+                        floor_need = float(_mm.group(1).replace(",", ""))
+                    except ValueError:
+                        floor_need = None
+                    if floor_need:
+                        try:
+                            info2 = _aio.run(_sfp(site_url, proxy or None, price_floor=floor_need))
+                        except Exception:
+                            info2 = None
+                        if isinstance(info2, dict) and info2.get("variant_id"):
+                            return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, info2["variant_id"], proxy or None))
     return last
 
 
