@@ -913,7 +913,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             },
                             # digital: the browser's own captured input — NONE type,
                             # matching conditions, any price, no by-handle strategy
-                            **({} if requires_shipping else {
+                            **(({
                                 'selectedDeliveryStrategy': {
                                     'deliveryStrategyMatchingConditions': {
                                         'estimatedTimeInTransit': {'any': True},
@@ -921,13 +921,23 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     },
                                     'options': {}
                                 },
-                            }),
+                                'deliveryMethodTypes': ['NONE'],
+                                'expectedTotalPrice': {'any': True},
+                            } if not requires_shipping else {
+                                'selectedDeliveryStrategy': {
+                                    'deliveryStrategyByHandle': {
+                                        'handle': delivery_strategy if delivery_strategy else '',
+                                        'customDeliveryRate': False
+                                    },
+                                    'options': {'phone': phone}
+                                },
+                                'deliveryMethodTypes': ['SHIPPING'],
+                                'expectedTotalPrice': {
+                                    'value': {'amount': str(shipping_amount), 'currencyCode': currency}
+                                },
+                            })),
                             'targetMerchandiseLines': {
                                 'lines': [{'stableId': stableId or '1'}]
-                            },
-                            'deliveryMethodTypes': ['NONE'] if not requires_shipping else ['SHIPPING'],
-                            'expectedTotalPrice': {'any': True} if not requires_shipping else {
-                                'value': {'amount': str(shipping_amount), 'currencyCode': currency}
                             },
                             'destinationChanged': False
                         }],
