@@ -59,6 +59,10 @@ def pick_addr(url, cc=None, rc=None):
 
     ccn = C2C.get(cc)
 
+    # currency-matched country first (cc = store currency) — a US default address on a
+    # GBP/EUR/INR session triggers BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH
+    if ccn in book:
+        return book[ccn]
     if rc in book and ccn == rc:
         return book[rc]
     elif rc in book:
