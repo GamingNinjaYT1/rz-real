@@ -189,6 +189,7 @@ async def fetch_products(domain, proxy_str=None):
 
         min_price = float('inf')
         min_product = None
+        candidates = []
 
         for product in result:
             if not product.get('variants'):
@@ -205,6 +206,11 @@ async def fetch_products(domain, proxy_str=None):
                     else:
                         price = float(price)
 
+                    if price <= 0:
+                        continue
+
+                    candidates.append((price, str(variant['id'])))
+
                     if price < min_price:
                         min_price = price
                         min_product = {
@@ -217,6 +223,8 @@ async def fetch_products(domain, proxy_str=None):
                     continue
         
         if isinstance(min_product, dict) and min_product.get('variant_id'):
+            others = sorted(candidates, key=lambda x: x[0])
+            min_product['candidates'] = [vid for pr, vid in others if vid != min_product['variant_id']][:4]
             return min_product
         else:
             return False, "<b>No Valid Products</b>"
