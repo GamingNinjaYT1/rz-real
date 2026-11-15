@@ -597,6 +597,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, "No runningTotal in sellerProposal", gateway, total_price, currency
                 
                 running_total = running_total_data['value']['amount']
+                if float(running_total) <= 0:
+                    return False, "PAYMENTS_POSITIVE_AMOUNT_EXPECTED", gateway, total_price, currency
 
                 # stores with checkout-side repricing: the session's merch total is the
                 # authoritative price (page-scraped subtotal can be stale) — keep the

