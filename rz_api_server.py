@@ -385,7 +385,7 @@ def sh2_check():
     t0 = time.time()
     fut = _sh2_exec.submit(_sh2_run, cc, site, proxy, variant)
     try:
-        res = fut.result(timeout=300)
+        res = fut.result(timeout=420)
     except concurrent.futures.TimeoutError:
         fut.cancel()
         return jsonify({"error": "shopify check timed out"}), 504
@@ -488,7 +488,7 @@ def _sh2_run(cc, site, proxy, variant):
     parts = cc.split("|")
     ccn, mm, yy, cvv = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
     # never direct: user proxy first (if given), then healthiest pool proxies, max 3 attempts
-    proxies = _sh2_pick_proxies(proxy, 3)
+    proxies = _sh2_pick_proxies(proxy, 5)
     last = (False, "Unknown", "UNKNOWN", "0", "USD")
     for px in proxies:
         try:
