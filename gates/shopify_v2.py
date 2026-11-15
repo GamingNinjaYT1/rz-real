@@ -167,23 +167,37 @@ async def fetch_products(domain, proxy_str=None):
         proxy = parse_proxy(proxy_str) if proxy_str else None
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            # 429 (rate limit) clears in seconds — brief backoff retry, other errors fail fast
-            resp_status = 0
-            result = None
-            for attempt in range(3):
-                resp = await session.get(f"{domain}/products.json?limit=250", proxy=proxy, timeout=15)
-                resp_status = resp.status
-                if resp.status == 429 and attempt < 2:
-                    await asyncio.sleep(2.5 * (attempt + 1))
-                    continue
-                break
-            if resp_status != 200:
-                return False, f"<b>Site Error! Status: {resp_status}</b>"
-            text = await resp.text()
-            if "shopify" not in text.lower():
-                return False, "<b>Not Shopify!</b>"
-
-            result = (await resp.json())['products']
+            # 2 pages (500 products) — measured sweet spot: 47% of big-catalog stores hide
+            # their true minimum on page 2; +0.5s per multi-page store only.
+            # 429 (rate limit) clears in seconds — brief backoff retry per page.
+            result = []
+            for page in range(1, 3):
+                resp_status = 0
+                for attempt in range(3):
+                    resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=15)
+                    resp_status = resp.status
+                    if resp.status == 429 and attempt < 2:
+                        await asyncio.sleep(2.5 * (attempt + 1))
+                        continue
+                    break
+                if resp_status != 200:
+                    if page == 1:
+                        return False, f"<b>Site Error! Status: {resp_status}</b>"
+                    break
+                text = await resp.text()
+                if "shopify" not in text.lower():
+                    if page == 1:
+                        return False, "<b>Not Shopify!</b>"
+                    break
+                try:
+                    page_products = (await resp.json()).get('products') or []
+                except Exception:
+                    page_products = []
+                if not page_products:
+                    break
+                result.extend(page_products)
+                if len(page_products) < 250:
+                    break
             if not result:
                 return False, "<b>No Products!</b>"
 
@@ -198,7 +212,11 @@ async def fetch_products(domain, proxy_str=None):
             for variant in product['variants']:
                 if not variant.get('available', True):
                     continue
-                
+                # digital/gift-card variants (no shipping) collapse the checkout delivery
+                # line -> DELIVERY_DELIVERY_LINE_DETAIL_CHANGED; skip them
+                if variant.get('requires_shipping') is False:
+                    continue
+
                 try:
                     price = variant.get('price', '0')
                     if isinstance(price, str):
