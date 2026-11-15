@@ -803,16 +803,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
             json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
 
-            if requires_shipping:
-                # digital products: their apps re-price on EVERY submit attempt regardless
-                # of the delivery input (5 shapes + negotiate/omit combos tested) — the
-                # marker-based rotation in the caller is the handling
-                response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                    session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
-                )
+            # delivery proposal runs for ALL products — the negotiation assigns the
+            # digital line its strategy handle + stableId (read back below)
+            response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+            )
 
-                if is_captcha_required(resp_text):
-                    return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, total_price, currency
+            if is_captcha_required(resp_text):
+                return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, total_price, currency
 
                 # FINAL price sync from the delivery proposal's response — the negotiated
                 # totals here are the session's last state before submit; submitting with
@@ -1022,9 +1020,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if flex_terms_id:
                 submit_variables['input']['payment']['paymentFlexibilityTermsId'] = flex_terms_id
 
-            # digital products: omit the delivery section — triggers the churn marker
-            # that rotates to a shippable variant (mixed stores → real verdicts)
+            # digital products: replace the delivery section with noDeliveryRequired in
+            # the session's own collection shape (linesV2 + quantity) — the non-shipping
+            # cart's delivery line can't be echoed directly (detail-changed)
             if not requires_shipping:
+                # the delivery section is omitted: the non-shipping cart's delivery line
+                # cannot be echoed (7 input shapes tested — "detail changed", "total
+                # changed", or GraphQL validation on every one). Omitting triggers the
+                # churn marker that rotates to a shippable variant
                 submit_variables['input'].pop('delivery', None)
 
             submit_json_data = {
