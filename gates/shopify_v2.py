@@ -804,8 +804,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
 
             if requires_shipping:
-                # digital products: the delivery proposal churns non-shipping carts —
-                # skipped; the marker-based rotation in the caller handles them
+                # digital products: the delivery line for non-shipping carts can't be
+                # echoed (4 input shapes tested — Shopify's session state machine);
+                # the marker-based rotation in the caller handles them
                 response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
                     session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
                 )
@@ -1021,9 +1022,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if flex_terms_id:
                 submit_variables['input']['payment']['paymentFlexibilityTermsId'] = flex_terms_id
 
-            # digital products: omit the delivery section — the session's delivery line
-            # for non-shipping carts can't be echoed (detail-changed) and omitting
-            # triggers the churn marker that rotates to a shippable variant
+            # digital products: omit the delivery section — triggers the churn marker
+            # that rotates to a shippable variant (mixed stores → real verdicts)
             if not requires_shipping:
                 submit_variables['input'].pop('delivery', None)
 
