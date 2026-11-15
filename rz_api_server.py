@@ -369,6 +369,9 @@ def _sa_run(cc):
 
 
 
+# every /sh2 request is proxied; this resi is the default when the caller passes none
+_SH2_DEFAULT_PROXY = "dz46cabj:ksuRcKlNqJMU@103.161.113.230:18491"
+
 # ─── Shopify v2 lane (new checkout negotiation engine) — single-shot, no internal proxy logic ───
 _sh2_exec = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
@@ -380,7 +383,8 @@ def sh2_check():
         return jsonify({"error": "missing or invalid cc — use /sh2?site=<store>&cc=<card|mm|yy|cvv>"}), 400
     if not site:
         return jsonify({"error": "missing site — use /sh2?site=<store>&cc=<card|mm|yy|cvv>"}), 400
-    proxy = request.args.get("proxy", "").strip()
+    # every request goes through a proxy — caller's proxy, else the default resi
+    proxy = request.args.get("proxy", "").strip() or _SH2_DEFAULT_PROXY
     variant = request.args.get("variant", "").strip() or None
     t0 = time.time()
     fut = _sh2_exec.submit(_sh2_run, cc, site, proxy, variant)
