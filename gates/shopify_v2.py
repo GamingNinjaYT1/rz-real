@@ -167,28 +167,16 @@ async def fetch_products(domain, proxy_str=None):
         proxy = parse_proxy(proxy_str) if proxy_str else None
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            # paginate the full catalog so the lowest-priced variant is always seen
-            # (products.json defaults to ~30 products per page)
-            result = []
-            for page in range(1, 6):
-                resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=10)
+            async with session.get(f"{domain}/products.json", proxy=proxy, timeout=10) as resp:
                 if resp.status != 200:
-                    if page == 1:
-                        return False, f"<b>Site Error! Status: {resp.status}</b>"
-                    break
+                    return False, f"<b>Site Error! Status: {resp.status}</b>"
                 text = await resp.text()
                 if "shopify" not in text.lower():
-                    if page == 1:
-                        return False, "<b>Not Shopify!</b>"
-                    break
-                page_products = (await resp.json()).get('products') or []
-                if not page_products:
-                    break
-                result.extend(page_products)
-                if len(page_products) < 250:
-                    break
-            if not result:
-                return False, "<b>No Products!</b>"
+                    return False, "<b>Not Shopify!</b>"
+
+                result = (await resp.json())['products']
+                if not result:
+                    return False, "<b>No Products!</b>"
 
         min_price = float('inf')
         min_product = None
@@ -207,9 +195,6 @@ async def fetch_products(domain, proxy_str=None):
                         price = float(price.replace(',', ''))
                     else:
                         price = float(price)
-
-                    if price <= 0:
-                        continue
 
                     if price < min_price:
                         min_price = price
