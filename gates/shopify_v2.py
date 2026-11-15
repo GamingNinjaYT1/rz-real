@@ -783,8 +783,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
 
             if requires_shipping:
-                # digital products: no delivery proposal — negotiating delivery on a
-                # non-shipping cart mutates the session total and churns the submit
+                # digital products: the delivery proposal churns non-shipping carts —
+                # skipped; the marker-based rotation in the caller handles them
                 response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
                     session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
                 )
@@ -885,6 +885,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     'zoneCode': state, 'phone': phone
                                 }
                             },
+                            # the delivery-state sync supplies the session's CURRENT
+                            # strategy handle (digital carts get one assigned by the
+                            # delivery proposal too) — echo the full line exactly
                             'selectedDeliveryStrategy': {
                                 'deliveryStrategyByHandle': {
                                     'handle': delivery_strategy if delivery_strategy else '',
@@ -997,8 +1000,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if flex_terms_id:
                 submit_variables['input']['payment']['paymentFlexibilityTermsId'] = flex_terms_id
 
-            # digital products (requiresShipping=false): no delivery section — the
-            # delivery line collapsing is what caused DELIVERY_DELIVERY_LINE_DETAIL_CHANGED
+            # digital products: omit the delivery section — the session's delivery line
+            # for non-shipping carts can't be echoed (detail-changed) and omitting
+            # triggers the churn marker that rotates to a shippable variant
             if not requires_shipping:
                 submit_variables['input'].pop('delivery', None)
 
