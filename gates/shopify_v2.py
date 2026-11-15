@@ -813,6 +813,20 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 except Exception:
                     pass
 
+                # delivery-state sync: the submit must reference the session's CURRENT
+                # strategy handle and line stableId (they rotate on every proposal) —
+                # stale references trigger "Verify your shipping method" +
+                # PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT at submit
+                try:
+                    _sd = (((_bp.get('delivery') or {}).get('deliveryLines')) or [{}])[0].get('selectedDeliveryStrategy') or {}
+                    if _sd.get('handle'):
+                        delivery_strategy = _sd['handle']
+                    _sl = ((_bres.get('buyerProposal') or {}).get('merchandise') or {}).get('merchandiseLines') or []
+                    if _sl and _sl[0].get('stableId'):
+                        stableId = _sl[0]['stableId']
+                except Exception:
+                    pass
+
             payload = {
                 "credit_card": {
                     "number": cc,
