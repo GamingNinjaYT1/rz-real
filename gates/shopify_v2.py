@@ -571,7 +571,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, "No runningTotal in sellerProposal", gateway, total_price, currency
                 
                 running_total = running_total_data['value']['amount']
-                
+
+                # stores with checkout-side repricing: the session's merch total is the
+                # authoritative price (page-scraped subtotal can be stale) — keep the
+                # merchandise proposal and payment in sync with it
+                _bp = result.get('buyerProposal') or {}
+                _ml0 = ((_bp.get('merchandise') or {}).get('merchandiseLines') or [{}])[0]
+                _ma = ((_ml0.get('totalAmount') or {}).get('value') or {}).get('amount')
+                if _ma and float(_ma) > 0:
+                    subtotal = str(_ma)
+                    running_total = str(_ma)
+
             except (KeyError, TypeError) as e:
                 return False, f"Failed to parse proposal response: {str(e)}", gateway, total_price, currency
 
@@ -843,7 +853,18 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, "CAPTCHA_REQUIRED on submit", gateway, total_price, currency
             
             if "Your order total has changed." in text:
-                return False, "Site not supported", gateway, total_price, currency
+                # session re-priced between proposal and submit; the rejection carries the
+                # updated totals — resubmit once with the corrected amount
+                _ckm = re.search(r'"checkoutTotal":\{"value":\{"amount":"([0-9.]+)"', text)
+                if _ckm:
+                    submit_variables['input']['payment']['paymentLines'][0]['amount']['value']['amount'] = _ckm.group(1)
+                    response, text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                        session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
+                    )
+                    if "Your order total has changed." in text:
+                        return False, "Site not supported", gateway, total_price, currency
+                else:
+                    return False, "Site not supported", gateway, total_price, currency
             if "The requested payment method is not available." in text:
                 return False, "Payment method not available", gateway, total_price, currency
             
