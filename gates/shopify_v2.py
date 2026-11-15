@@ -163,11 +163,13 @@ async def fetch_products(domain, proxy_str=None):
             domain = "https://" + domain
         
         proxy = parse_proxy(proxy_str) if proxy_str else None
-        # product fetch: proxy only, never direct (route rotates proxies on failure)
-        attempts = []
+        # product fetch: proxy given -> proxy only (never silently direct);
+        # no proxy given -> direct is the caller's explicit choice
         if proxy:
-            attempts.append({"http": proxy, "https": proxy})
-            attempts.append({"http": proxy, "https": proxy})
+            _px = {"http": proxy, "https": proxy}
+            attempts = [_px, _px]
+        else:
+            attempts = [None]
 
         if not attempts:
             return False, "<b>Proxy Error: no proxy configured</b>"
