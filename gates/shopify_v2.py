@@ -167,9 +167,9 @@ async def fetch_products(domain, proxy_str=None):
         proxy = parse_proxy(proxy_str) if proxy_str else None
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            # up to 3 pages (750 products) — catches cheap items deeper in the catalog
+            # up to 2 pages (500 products) — coverage vs speed balance
             result = []
-            for page in range(1, 4):
+            for page in range(1, 3):
                 resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=10)
                 if resp.status != 200:
                     if page == 1:
