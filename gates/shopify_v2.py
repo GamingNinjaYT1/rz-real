@@ -171,7 +171,7 @@ async def fetch_products(domain, proxy_str=None):
             resp_status = 0
             result = None
             for attempt in range(3):
-                resp = await session.get(f"{domain}/products.json", proxy=proxy, timeout=10)
+                resp = await session.get(f"{domain}/products.json?limit=250", proxy=proxy, timeout=15)
                 resp_status = resp.status
                 if resp.status == 429 and attempt < 2:
                     await asyncio.sleep(2.5 * (attempt + 1))
