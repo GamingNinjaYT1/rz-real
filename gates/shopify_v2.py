@@ -156,7 +156,7 @@ async def make_graphql_request_with_captcha_handling(
     
     return response, response_text, False
 
-async def fetch_products(domain, proxy_str=None):
+async def fetch_products(domain, proxy_str=None, price_floor=None):
     try:
         if not domain.startswith('http'):
             domain = "https://" + domain
