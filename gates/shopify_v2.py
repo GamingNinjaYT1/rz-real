@@ -794,9 +794,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 json_data['variables']['delivery']['deliveryLines'][0]['targetMerchandiseLines'] = {
                     'lines': [{'stableId': stableId or '1'}]
                 }
-            json_data['variables']['delivery']['deliveryLines'][0]['expectedTotalPrice'] = {
-                'value': {'amount': str(shipping_amount), 'currencyCode': currency}
-            }
+            if requires_shipping:
+                json_data['variables']['delivery']['deliveryLines'][0]['expectedTotalPrice'] = {
+                    'value': {'amount': str(shipping_amount), 'currencyCode': currency}
+                }
+            else:
+                json_data['variables']['delivery']['deliveryLines'][0]['expectedTotalPrice'] = {'any': True}
             json_data['variables']['delivery']['deliveryLines'][0]['destinationChanged'] = False
             json_data['variables']['payment']['billingAddress'] = {
                 'streetAddress': {
@@ -814,44 +817,40 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
                 session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
             )
-
             if is_captcha_required(resp_text):
                 return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, total_price, currency
 
-                # FINAL price sync from the delivery proposal's response — the negotiated
-                # totals here are the session's last state before submit; submitting with
-                # proposal-1 prices is what triggers "Your order total has changed"
-                try:
-                    _dj = json.loads(resp_text)
-                    _bres = _dj.get('data', {}).get('session', {}).get('negotiate', {}).get('result', {})
-                    _bp = _bres.get('buyerProposal') or {}
-                    _ml0 = ((_bp.get('merchandise') or {}).get('merchandiseLines') or [{}])[0]
-                    _ma = ((_ml0.get('totalAmount') or {}).get('value') or {}).get('amount')
-                    if _ma and float(_ma) > 0:
-                        subtotal = str(_ma)
-                        running_total = str(_ma)
-                    _rt2 = ((_bp.get('runningTotal') or {}).get('value') or {}).get('amount')
-                    if _rt2 and float(_rt2) > 0:
-                        running_total = str(_rt2)
-                    _ct2 = ((_bp.get('checkoutTotal') or {}).get('value') or {}).get('amount')
-                    if _ct2:
-                        checkout_total_final = str(_ct2)
-                except Exception:
-                    pass
+            # FINAL price sync from the delivery proposal's response — the negotiated
+            # totals here are the session's last state before submit
+            try:
+                _dj = json.loads(resp_text)
+                _bres = _dj.get('data', {}).get('session', {}).get('negotiate', {}).get('result', {})
+                _bp = _bres.get('buyerProposal') or {}
+                _ml0 = ((_bp.get('merchandise') or {}).get('merchandiseLines') or [{}])[0]
+                _ma = ((_ml0.get('totalAmount') or {}).get('value') or {}).get('amount')
+                if _ma and float(_ma) > 0:
+                    subtotal = str(_ma)
+                    running_total = str(_ma)
+                _rt2 = ((_bp.get('runningTotal') or {}).get('value') or {}).get('amount')
+                if _rt2 and float(_rt2) > 0:
+                    running_total = str(_rt2)
+                _ct2 = ((_bp.get('checkoutTotal') or {}).get('value') or {}).get('amount')
+                if _ct2:
+                    checkout_total_final = str(_ct2)
+            except Exception:
+                pass
 
-                # delivery-state sync: the submit must reference the session's CURRENT
-                # strategy handle and line stableId (they rotate on every proposal) —
-                # stale references trigger "Verify your shipping method" +
-                # PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT at submit
-                try:
-                    _sd = (((_bp.get('delivery') or {}).get('deliveryLines')) or [{}])[0].get('selectedDeliveryStrategy') or {}
-                    if _sd.get('handle'):
-                        delivery_strategy = _sd['handle']
-                    _sl = ((_bres.get('buyerProposal') or {}).get('merchandise') or {}).get('merchandiseLines') or []
-                    if _sl and _sl[0].get('stableId'):
-                        stableId = _sl[0]['stableId']
-                except Exception:
-                    pass
+            # delivery-state sync: the submit must reference the session's CURRENT
+            # strategy handle and line stableId (they rotate on every proposal)
+            try:
+                _sd = (((_bp.get('delivery') or {}).get('deliveryLines')) or [{}])[0].get('selectedDeliveryStrategy') or {}
+                if _sd.get('handle'):
+                    delivery_strategy = _sd['handle']
+                _sl = ((_bres.get('buyerProposal') or {}).get('merchandise') or {}).get('merchandiseLines') or []
+                if _sl and _sl[0].get('stableId'):
+                    stableId = _sl[0]['stableId']
+            except Exception:
+                pass
 
             payload = {
                 "credit_card": {
@@ -911,8 +910,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     'zoneCode': state, 'phone': phone
                                 }
                             },
-                            # digital: the browser's own captured input — NONE type,
-                            # matching conditions, any price, no by-handle strategy
+                            # digital: deliveryMethodTypes NONE + matching conditions
+                            # (the only input shape the session accepts for non-shipping)
                             **(({
                                 'selectedDeliveryStrategy': {
                                     'deliveryStrategyMatchingConditions': {
@@ -921,8 +920,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     },
                                     'options': {}
                                 },
-                                'deliveryMethodTypes': ['NONE'],
+                                'deliveryMethodTypes': [],
                                 'expectedTotalPrice': {'any': True},
+                                'targetMerchandiseLines': {'any': True},
                             } if not requires_shipping else {
                                 'selectedDeliveryStrategy': {
                                     'deliveryStrategyByHandle': {
@@ -936,6 +936,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     'value': {'amount': str(shipping_amount), 'currencyCode': currency}
                                 },
                             })),
+
+
                             'targetMerchandiseLines': {
                                 'lines': [{'stableId': stableId or '1'}]
                             },
@@ -1036,16 +1038,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             # selected flexibility terms id or the payment is rejected
             if flex_terms_id:
                 submit_variables['input']['payment']['paymentFlexibilityTermsId'] = flex_terms_id
-
-            # digital products: replace the delivery section with noDeliveryRequired in
-            # the session's own collection shape (linesV2 + quantity) — the non-shipping
-            # cart's delivery line can't be echoed directly (detail-changed)
-            if not requires_shipping:
-                # the delivery section is omitted: the non-shipping cart's delivery line
-                # cannot be echoed (7 input shapes tested — "detail changed", "total
-                # changed", or GraphQL validation on every one). Omitting triggers the
-                # churn marker that rotates to a shippable variant
-                submit_variables['input'].pop('delivery', None)
 
             submit_json_data = {
                 'query': MUTATION_SUBMIT,
