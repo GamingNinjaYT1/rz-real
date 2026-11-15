@@ -420,9 +420,6 @@ def _sh2_run(cc, site, proxy, variant):
     parts = cc.split("|")
     ccn, mm, yy, cvv = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
 
-    async def _one(vid):
-        return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, vid, proxy or None))
-
     if variant:
         return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, variant, proxy or None))
 
@@ -440,7 +437,7 @@ def _sh2_run(cc, site, proxy, variant):
 
     last = (False, "Unknown", "UNKNOWN", "0", "USD")
     for vid in cands[:3]:
-        res = _one(vid)
+        res = _aio.run(_sh2pc(ccn, mm, yy, cvv, site, vid, proxy or None))
         last = res
         if "PAYMENTS_POSITIVE_AMOUNT_EXPECTED" not in str(res[1]):
             return res
