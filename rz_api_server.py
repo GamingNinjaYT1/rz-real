@@ -441,8 +441,17 @@ def _sh2_run(cc, site, proxy, variant):
     cands = [{"id": info["variant_id"], "price": float(info.get("price") or 0)}]
     cands += [c for c in (info.get("candidates") or []) if c["id"] not in tried]
 
-    ROTATE_MARKERS = ("PAYMENTS_POSITIVE_AMOUNT_EXPECTED", "DIGITAL_PRODUCT_CHURN", "VALIDATION_CUSTOM")
+    ROTATE_MARKERS = ("PAYMENTS_POSITIVE_AMOUNT_EXPECTED", "DIGITAL_PRODUCT_CHURN", "VALIDATION_CUSTOM", "Cart failed")
     last = (False, "Unknown", "UNKNOWN", "0", "USD")
+
+    def _with_catalog_price(res, price):
+        # display price = the checked variant's catalog price (the store's listing)
+        try:
+            if isinstance(res, tuple) and len(res) >= 4 and price:
+                return (res[0], res[1], res[2], str(price), res[4])
+        except Exception:
+            pass
+        return res
 
     # rotation runs in parallel batches of 3 — total rotation latency stays ~one
     # check round (~15s) instead of N sequential rounds
@@ -463,13 +472,14 @@ def _sh2_run(cc, site, proxy, variant):
             results = _aio.run(_batch())
         except Exception:
             continue
-        for res in results:
+        for res, c in zip(results, to_run):
             if isinstance(res, tuple):
+                res = _with_catalog_price(res, c.get("price"))
                 last = res
         # first real verdict wins
-        for res in results:
+        for res, c in zip(results, to_run):
             if isinstance(res, tuple) and not any(m in str(res[1]) for m in ROTATE_MARKERS):
-                return res
+                return _with_catalog_price(res, c.get("price"))
         # all candidates in this batch rotated — check for a minimum-order rule and
         # deep-search the catalog for a variant above it
         for res in results:
@@ -486,7 +496,8 @@ def _sh2_run(cc, site, proxy, variant):
                         except Exception:
                             info2 = None
                         if isinstance(info2, dict) and info2.get("variant_id"):
-                            return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, info2["variant_id"], proxy or None))
+                            _fres = _aio.run(_sh2pc(ccn, mm, yy, cvv, site, info2["variant_id"], proxy or None))
+                            return _with_catalog_price(_fres, info2.get("price"))
     return last
 
 

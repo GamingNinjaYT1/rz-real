@@ -207,11 +207,11 @@ async def fetch_products(domain, proxy_str=None, price_floor=None):
                         return False, "<b>No Products above minimum</b>"
                 return False, "<b>No Products above minimum</b>"
 
-            # 2 pages (500 products) — measured sweet spot: 47% of big-catalog stores hide
-            # their true minimum on page 2; +0.5s per multi-page store only.
-            # 429 (rate limit) clears in seconds — brief backoff retry per page.
+            # deep pagination (up to 5 pages / 1250 products) with early exit —
+            # big catalogs hide their true minimum deep; stop as soon as a variant
+            # ≤ $5 is found (matches rukia's picks). 429 backoff per page.
             result = []
-            for page in range(1, 3):
+            for page in range(1, 6):
                 resp_status = 0
                 for attempt in range(3):
                     resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=15)
@@ -250,8 +250,6 @@ async def fetch_products(domain, proxy_str=None, price_floor=None):
                 continue
             
             for variant in product['variants']:
-                if not variant.get('available', True):
-                    continue
                 try:
                     price = variant.get('price', '0')
                     if isinstance(price, str):
@@ -357,6 +355,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if isinstance(info, tuple) and info[0] is False:
                 return False, info[1], gateway, total_price, currency
             variant_id = info['variant_id']
+            # display price = the picked variant's catalog price (the store's own listing),
+            # not the session total — matches what the reference API reports
+            total_price = info['price']
 
         connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=30)
@@ -749,7 +750,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         displayName = payment_method.get('extensibilityDisplayName') or payment_method.get('name', 'Unknown')
                         
                         gateway = payment_method.get('extensibilityDisplayName') or payment_method.get('name', 'UNKNOWN')
-                        total_price = str(float(running_total) + shipping_amount + tax_amount)
                         
                         break
             
