@@ -167,16 +167,25 @@ async def fetch_products(domain, proxy_str=None):
         proxy = parse_proxy(proxy_str) if proxy_str else None
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            async with session.get(f"{domain}/products.json", proxy=proxy, timeout=10) as resp:
-                if resp.status != 200:
-                    return False, f"<b>Site Error! Status: {resp.status}</b>"
-                text = await resp.text()
-                if "shopify" not in text.lower():
-                    return False, "<b>Not Shopify!</b>"
+            # 429 (rate limit) clears in seconds — brief backoff retry, other errors fail fast
+            resp_status = 0
+            result = None
+            for attempt in range(3):
+                resp = await session.get(f"{domain}/products.json", proxy=proxy, timeout=10)
+                resp_status = resp.status
+                if resp.status == 429 and attempt < 2:
+                    await asyncio.sleep(2.5 * (attempt + 1))
+                    continue
+                break
+            if resp_status != 200:
+                return False, f"<b>Site Error! Status: {resp_status}</b>"
+            text = await resp.text()
+            if "shopify" not in text.lower():
+                return False, "<b>Not Shopify!</b>"
 
-                result = (await resp.json())['products']
-                if not result:
-                    return False, "<b>No Products!</b>"
+            result = (await resp.json())['products']
+            if not result:
+                return False, "<b>No Products!</b>"
 
         min_price = float('inf')
         min_product = None
