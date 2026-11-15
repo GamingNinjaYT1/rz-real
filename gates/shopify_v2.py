@@ -167,6 +167,42 @@ async def fetch_products(domain, proxy_str=None):
         proxy = parse_proxy(proxy_str) if proxy_str else None
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            if price_floor:
+                # deep catalog search: paginate until a variant priced at or above the
+                # store's minimum is found (VALIDATION_CUSTOM recovery)
+                for page in range(1, 9):
+                    resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=15)
+                    if resp.status != 200:
+                        return False, f"<b>Site Error! Status: {resp.status}</b>"
+                    text = await resp.text()
+                    if "shopify" not in text.lower():
+                        return False, "<b>Not Shopify!</b>"
+                    try:
+                        page_products = (await resp.json()).get('products') or []
+                    except Exception:
+                        page_products = []
+                    if not page_products:
+                        return False, "<b>No Products above minimum</b>"
+                    best = None
+                    for product in page_products:
+                        if not product.get('variants'):
+                            continue
+                        for variant in product['variants']:
+                            if not variant.get('available', True):
+                                continue
+                            try:
+                                pr = float(str(variant.get('price', '0')).replace(',', ''))
+                            except (ValueError, TypeError):
+                                continue
+                            if pr >= price_floor and (best is None or pr < best[0]):
+                                best = (pr, str(variant['id']), f"{domain}/products/{product['handle']}")
+                    if best:
+                        return {'site': domain, 'price': f"{best[0]:.2f}", 'variant_id': best[1],
+                                'link': best[2], 'candidates': []}
+                    if len(page_products) < 250:
+                        return False, "<b>No Products above minimum</b>"
+                return False, "<b>No Products above minimum</b>"
+
             # 2 pages (500 products) — measured sweet spot: 47% of big-catalog stores hide
             # their true minimum on page 2; +0.5s per multi-page store only.
             # 429 (rate limit) clears in seconds — brief backoff retry per page.
@@ -981,10 +1017,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             code = error.get('code', '')
                             localized_msg = error.get('localizedMessage', '')
                             non_localized_msg = error.get('nonLocalizedMessage', '')
-                            # If code is generic, prefer the localized/non-localized message for the real decline reason
-                            if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', ''):
+                            # generic codes: surface the issuer/store message. VALIDATION_CUSTOM:
+                            # surface the store rule (the caller parses the minimum from it
+                            # and rotates to a variant above it)
+                            if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', '', 'VALIDATION_CUSTOM'):
                                 detail = localized_msg or non_localized_msg
                                 if detail:
+                                    if code == 'VALIDATION_CUSTOM':
+                                        detail = f"VALIDATION_CUSTOM: {detail}"
                                     return False, detail, gateway, total_price, currency
                             if code:
                                 return False, code, gateway, total_price, currency
