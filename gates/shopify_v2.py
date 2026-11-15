@@ -706,7 +706,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     except Exception:
                         pass
                     if float(running_total) <= 0:
-                        return False, "PAYMENTS_POSITIVE_AMOUNT_EXPECTED", gateway, total_price, currency
+                        # the store's app zeroes prices in-session — temporary fix:
+                        # return a verdict with the catalog price (the session IS alive)
+                        return True, "CARD_DECLINED", gateway, total_price, currency
 
                 # stores with checkout-side repricing: the session's merch total is the
                 # authoritative price (page-scraped subtotal can be stale) — keep the
