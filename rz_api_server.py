@@ -414,19 +414,21 @@ def sh2_check():
         "timetaken": f"{time.time()-t0:.1f}s",
     })
 
+# proven-working proxies first (pass CF + HTTPS), blocked/dead ones last
 _SH2_PROXY_POOL = [
     "3dfw7c6x:oSeqx0CNeV0k@103.183.121.128:58122",
     "azqdr5vn:71WCPuMwyc72@103.183.121.211:11657",
     "y7g4dd8d:Buw96jtGFKA5@103.183.121.59:34219",
-    "zqrn9y5d:zQRN9y5d@103.156.91.173:58798",
     "dz46cabj:ksuRcKlNqJMU@103.161.113.230:18491",
-    "RrkJjUqfT:jYEH6Emdg@82.117.94.14:63126",
     "1DnugnypC:4yPtzMd3f@193.254.17.97:64708",
     "nWtrJqsb:RYYEE72Y@194.33.9.114:64170",
     "nWtrJqsb:RYYEE72Y@194.33.9.136:49520",
-    "oldg6k2r:oLdG6k2R@135.148.117.75:59813",
-    "fwos7n0b:fWOS7n0B@51.195.198.170:36647",
     "nWtrJqsb:RYYEE72Y@45.145.162.63:58536",
+    "fwos7n0b:fWOS7n0B@51.195.198.170:36647",
+    "RrkJjUqfT:jYEH6Emdg@82.117.94.14:63126",
+    "oldg6k2r:oLdG6k2R@135.148.117.75:59813",
+    "naveed:Qwerty_123ABC@103.204.108.142:12345",
+    "naveed:Qwerty_123ABC@196.244.48.124:12345",
     "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@au-syd.pvdata.host:8080",
     "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@se-got.pvdata.host:8080",
     "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@is-rey.pvdata.host:8080",
@@ -436,8 +438,7 @@ _SH2_PROXY_POOL = [
     "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@ca-mon.pvdata.host:8080",
     "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@id-jak.pvdata.host:8080",
     "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@pl-tor.pvdata.host:8080",
-    "naveed:Qwerty_123ABC@103.204.108.142:12345",
-    "naveed:Qwerty_123ABC@196.244.48.124:12345",
+    "zqrn9y5d:zQRN9y5d@103.156.91.173:58798",
 ]
 
 _SH2_RETRY_VERDICTS = (
@@ -446,34 +447,66 @@ _SH2_RETRY_VERDICTS = (
     "Invalid JSON", "Change Proxy or Site", "Throttled", "Cart failed",
 )
 
+# proxy health circuit breaker: transport-bad proxies get a cooldown, healthy first
+_SH2_PROXY_HEALTH = {}
+_SH2_COOLDOWN_SEC = 600
+
+def _sh2_pick_proxies(user_proxy, n=3):
+    import time as _t
+    now = _t.time()
+    def score(p):
+        h = _SH2_PROXY_HEALTH.get(p)
+        if not h:
+            return (0, 0)
+        if h.get("cooldown_until", 0) > now:
+            return (-100, 0)
+        return (h.get("ok", 0), -h.get("bad", 0))
+    pool = [p for p in _SH2_PROXY_POOL if _SH2_PROXY_HEALTH.get(p, {"cooldown_until": 0}).get("cooldown_until", 0) <= now]
+    pool.sort(key=score, reverse=True)
+    out = []
+    if user_proxy:
+        out.append(user_proxy)
+    for p in pool:
+        if p not in out:
+            out.append(p)
+        if len(out) >= n:
+            break
+    return out
+
+def _sh2_mark_proxy(px, ok):
+    import time as _t
+    h = _SH2_PROXY_HEALTH.setdefault(px, {"ok": 0, "bad": 0, "cooldown_until": 0})
+    if ok:
+        h["ok"] += 1
+    else:
+        h["bad"] += 1
+        h["cooldown_until"] = _t.time() + _SH2_COOLDOWN_SEC
+
 def _sh2_run(cc, site, proxy, variant):
     from gates.shopify_v2 import process_card as _sh2pc
     import asyncio as _aio
-    import random as _rnd
     parts = cc.split("|")
     ccn, mm, yy, cvv = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
-    # never direct: user proxy first (if given), then pool proxies, max 3 attempts
-    proxies = []
-    if proxy:
-        proxies.append(proxy)
-    pool = _SH2_PROXY_POOL[:]
-    _rnd.shuffle(pool)
-    proxies.extend(pool)
-    proxies = proxies[:3]
+    # never direct: user proxy first (if given), then healthiest pool proxies, max 3 attempts
+    proxies = _sh2_pick_proxies(proxy, 3)
     last = (False, "Unknown", "UNKNOWN", "0", "USD")
     for px in proxies:
         try:
             res = _aio.run(_sh2pc(ccn, mm, yy, cvv, site, variant, px))
         except Exception as e:
+            _sh2_mark_proxy(px, False)
             last = (False, f"Proxy Error: {type(e).__name__}: {str(e)[:60]}", "UNKNOWN", "0", "USD")
             continue
         last = res
         msg = str(res[1])
         if any(bad in msg for bad in _SH2_RETRY_VERDICTS):
+            proxy_bad = ("Proxy Error" in msg or "Site Error! Status: 403" in msg
+                         or "Invalid JSON" in msg or "Cart failed" in msg)
+            _sh2_mark_proxy(px, not proxy_bad)
             continue
+        _sh2_mark_proxy(px, True)
         return res
     return last
-
 
 # ─── Xonic Unified Gateway — root listing + per-gate health tracking ───
 from collections import deque as _dq
