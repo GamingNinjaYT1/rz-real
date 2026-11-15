@@ -683,7 +683,28 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 _ftm = re.search(r'"paymentFlexibilityPaymentTermsTemplate":\{"id":"([^"]+)"', resp_text)
                 flex_terms_id = _ftm.group(1) if _ftm else None
                 if float(running_total) <= 0:
-                    return False, "PAYMENTS_POSITIVE_AMOUNT_EXPECTED", gateway, total_price, currency
+                    # session pricing is async — the cart may not be priced when the
+                    # first proposal lands; re-propose once before giving up
+                    response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                        session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+                    )
+                    try:
+                        _rj2 = json.loads(resp_text)
+                        _res2 = _rj2['data']['session']['negotiate']
+                        _sp2 = _res2['sellerProposal']
+                        _rt2 = _sp2['runningTotal']['value']['amount']
+                        if float(_rt2) > 0:
+                            running_total = str(_rt2)
+                            _bp2 = _res2.get('buyerProposal') or {}
+                            _ml2 = ((_bp2.get('merchandise') or {}).get('merchandiseLines') or [{}])[0]
+                            _ma2 = ((_ml2.get('totalAmount') or {}).get('value') or {}).get('amount')
+                            if _ma2 and float(_ma2) > 0:
+                                subtotal = str(_ma2)
+                                running_total = str(_ma2)
+                    except Exception:
+                        pass
+                    if float(running_total) <= 0:
+                        return False, "PAYMENTS_POSITIVE_AMOUNT_EXPECTED", gateway, total_price, currency
 
                 # stores with checkout-side repricing: the session's merch total is the
                 # authoritative price (page-scraped subtotal can be stale) — keep the
