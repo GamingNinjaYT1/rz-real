@@ -268,6 +268,7 @@ async def fetch_products(domain, proxy_str=None, price_floor=None):
                             'site': domain,
                             'price': f"{price:.2f}",
                             'variant_id': str(variant['id']),
+                            'requires_shipping': variant.get('requires_shipping'),
                             'link': f"{domain}/products/{product['handle']}"
                         }
                 except (ValueError, TypeError, AttributeError):
@@ -355,6 +356,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if isinstance(info, tuple) and info[0] is False:
                 return False, info[1], gateway, total_price, currency
             variant_id = info['variant_id']
+            # digital detection BEFORE the proposals — the delivery input differs
+            # (deliveryMethodTypes NONE, any-price, matching-conditions strategy)
+            if info.get('requires_shipping') is False:
+                requires_shipping = False
             # display price = the picked variant's catalog price (the store's own listing),
             # not the session total — matches what the reference API reports
             total_price = info['price']
@@ -545,7 +550,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 'options': {}
                             },
                             'targetMerchandiseLines': {'any': True},
-                            'deliveryMethodTypes': ['SHIPPING'],
+                            'deliveryMethodTypes': ['NONE'] if not requires_shipping else ['SHIPPING'],
                             'expectedTotalPrice': {'any': True},
                             'destinationChanged': True
                         }],
@@ -778,16 +783,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, "No valid payment method found", gateway, total_price, currency
             
             json_data['query'] = QUERY_PROPOSAL_DELIVERY
-            json_data['variables']['delivery']['deliveryLines'][0]['selectedDeliveryStrategy'] = {
-                'deliveryStrategyByHandle': {
-                    'handle': delivery_strategy if delivery_strategy else '',
-                    'customDeliveryRate': False
-                },
-                'options': {}
-            }
-            json_data['variables']['delivery']['deliveryLines'][0]['targetMerchandiseLines'] = {
-                'lines': [{'stableId': stableId or '1'}]
-            }
+            if requires_shipping:
+                json_data['variables']['delivery']['deliveryLines'][0]['selectedDeliveryStrategy'] = {
+                    'deliveryStrategyByHandle': {
+                        'handle': delivery_strategy if delivery_strategy else '',
+                        'customDeliveryRate': False
+                    },
+                    'options': {}
+                }
+                json_data['variables']['delivery']['deliveryLines'][0]['targetMerchandiseLines'] = {
+                    'lines': [{'stableId': stableId or '1'}]
+                }
             json_data['variables']['delivery']['deliveryLines'][0]['expectedTotalPrice'] = {
                 'value': {'amount': str(shipping_amount), 'currencyCode': currency}
             }
@@ -905,21 +911,22 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     'zoneCode': state, 'phone': phone
                                 }
                             },
-                            # the delivery-state sync supplies the session's CURRENT
-                            # strategy handle (digital carts get one assigned by the
-                            # delivery proposal too) — echo the full line exactly
-                            'selectedDeliveryStrategy': {
-                                'deliveryStrategyByHandle': {
-                                    'handle': delivery_strategy if delivery_strategy else '',
-                                    'customDeliveryRate': False
+                            # digital: the browser's own captured input — NONE type,
+                            # matching conditions, any price, no by-handle strategy
+                            **({} if requires_shipping else {
+                                'selectedDeliveryStrategy': {
+                                    'deliveryStrategyMatchingConditions': {
+                                        'estimatedTimeInTransit': {'any': True},
+                                        'shipments': {'any': True}
+                                    },
+                                    'options': {}
                                 },
-                                'options': {'phone': phone}
-                            },
+                            }),
                             'targetMerchandiseLines': {
                                 'lines': [{'stableId': stableId or '1'}]
                             },
-                            'deliveryMethodTypes': ['SHIPPING'],
-                            'expectedTotalPrice': {
+                            'deliveryMethodTypes': ['NONE'] if not requires_shipping else ['SHIPPING'],
+                            'expectedTotalPrice': {'any': True} if not requires_shipping else {
                                 'value': {'amount': str(shipping_amount), 'currencyCode': currency}
                             },
                             'destinationChanged': False
