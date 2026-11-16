@@ -1,4 +1,5 @@
 import asyncio
+import socket
 import aiohttp
 import json
 import re
@@ -165,17 +166,23 @@ async def fetch_products(domain, proxy_str=None, price_floor=None):
         if not domain.startswith('http'):
             domain = "https://" + domain
         
-        connector = aiohttp.TCPConnector(ssl=False)
+        connector = aiohttp.TCPConnector(ssl=False, family=socket.AF_INET)
         timeout = aiohttp.ClientTimeout(total=10)
         
         proxy = parse_proxy(proxy_str) if proxy_str else None
+        
+        fetch_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             if price_floor:
                 # deep catalog search: paginate until a variant priced at or above the
                 # store's minimum is found (VALIDATION_CUSTOM recovery)
                 for page in range(1, 9):
-                    resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=15)
+                    resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=15, headers=fetch_headers)
                     if resp.status != 200:
                         return False, f"<b>Site Error! Status: {resp.status}</b>"
                     text = await resp.text()
@@ -212,7 +219,7 @@ async def fetch_products(domain, proxy_str=None, price_floor=None):
             for page in range(1, 3):
                 resp_status = 0
                 for attempt in range(3):
-                    resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=15)
+                    resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxy=proxy, timeout=15, headers=fetch_headers)
                     resp_status = resp.status
                     if resp.status == 429 and attempt < 2:
                         await asyncio.sleep(2.5 * (attempt + 1))
