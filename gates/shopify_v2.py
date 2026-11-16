@@ -60,6 +60,8 @@ def pick_addr(url, cc=None, rc=None):
 
     ccn = C2C.get(cc)
 
+    if ccn in book:
+        return book[ccn]
     if rc in book and ccn == rc:
         return book[rc]
     elif rc in book:
@@ -743,26 +745,26 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if is_captcha_required(resp_text):
                     return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, total_price, currency
 
-                # FINAL price sync from the delivery proposal's response — the negotiated
-                # totals here are the session's last state before submit; submitting with
-                # proposal-1 prices is what triggers "Your order total has changed"
-                try:
-                    _dj = json.loads(resp_text)
-                    _bres = _dj.get('data', {}).get('session', {}).get('negotiate', {}).get('result', {})
-                    _bp = _bres.get('buyerProposal') or {}
-                    _ml0 = ((_bp.get('merchandise') or {}).get('merchandiseLines') or [{}])[0]
-                    _ma = ((_ml0.get('totalAmount') or {}).get('value') or {}).get('amount')
-                    if _ma and float(_ma) > 0:
-                        subtotal = str(_ma)
-                        running_total = str(_ma)
-                    _rt2 = ((_bp.get('runningTotal') or {}).get('value') or {}).get('amount')
-                    if _rt2 and float(_rt2) > 0:
-                        running_total = str(_rt2)
-                    _ct2 = ((_bp.get('checkoutTotal') or {}).get('value') or {}).get('amount')
-                    if _ct2:
-                        checkout_total_final = str(_ct2)
-                except Exception:
-                    pass
+            # FINAL price sync from the delivery proposal's response — the negotiated
+            # totals here are the session's last state before submit; submitting with
+            # proposal-1 prices is what triggers "Your order total has changed"
+            try:
+                _dj = json.loads(resp_text)
+                _bres = _dj.get('data', {}).get('session', {}).get('negotiate', {}).get('result', {})
+                _bp = _bres.get('buyerProposal') or {}
+                _ml0 = ((_bp.get('merchandise') or {}).get('merchandiseLines') or [{}])[0]
+                _ma = ((_ml0.get('totalAmount') or {}).get('value') or {}).get('amount')
+                if _ma and float(_ma) > 0:
+                    subtotal = str(_ma)
+                    running_total = str(_ma)
+                _rt2 = ((_bp.get('runningTotal') or {}).get('value') or {}).get('amount')
+                if _rt2 and float(_rt2) > 0:
+                    running_total = str(_rt2)
+                _ct2 = ((_bp.get('checkoutTotal') or {}).get('value') or {}).get('amount')
+                if _ct2:
+                    checkout_total_final = str(_ct2)
+            except Exception:
+                pass
 
                 # display price = the session's ACTUAL total (with automatic discounts
                 # applied by the store via acceptUnexpectedDiscounts)
@@ -953,11 +955,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if flex_terms_id:
                 submit_variables['input']['payment']['paymentFlexibilityTermsId'] = flex_terms_id
 
-            # digital products (requiresShipping=false): no delivery section — the
-            # delivery line collapsing is what caused DELIVERY_DELIVERY_LINE_DETAIL_CHANGED
-            if not requires_shipping:
-                submit_variables['input'].pop('delivery', None)
-
+            if os.environ.get("SH2_DUMP"):
+                with open("/tmp/submit_vars_dump.json", "w") as f:
+                    json.dump(submit_variables['input'], f, indent=2, default=str)
             submit_json_data = {
                 'query': MUTATION_SUBMIT,
                 'variables': submit_variables,
