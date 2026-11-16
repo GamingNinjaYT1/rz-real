@@ -303,6 +303,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
     checkout_total_final = None
     running_total = "0.00"
     requires_shipping = True
+    session_delivery_method_types = None
 
 
     try:
@@ -785,6 +786,16 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 except Exception:
                     pass
 
+                # sync deliveryMethodTypes from the session's delivery line —
+                # the server may change it for digital products
+                try:
+                    _dl = ((_bp.get('delivery') or {}).get('deliveryLines')) or [{}]
+                    _dmt = _dl[0].get('deliveryMethodTypes')
+                    if _dmt:
+                        session_delivery_method_types = _dmt
+                except Exception:
+                    pass
+
             payload = {
                 "credit_card": {
                     "number": cc,
@@ -853,7 +864,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             'targetMerchandiseLines': {
                                 'lines': [{'stableId': stableId or '1'}]
                             },
-                            'deliveryMethodTypes': ['SHIPPING'],
+                            'deliveryMethodTypes': session_delivery_method_types or ['SHIPPING'],
                             'expectedTotalPrice': {
                                 'value': {'amount': str(shipping_amount), 'currencyCode': currency}
                             },
@@ -954,6 +965,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             # selected flexibility terms id or the payment is rejected
             if flex_terms_id:
                 submit_variables['input']['payment']['paymentFlexibilityTermsId'] = flex_terms_id
+
+            # digital products: empty the deliveryLines — the delivery proposal
+            # negotiated the state server-side; the submit tells Shopify to use it
+            if not requires_shipping:
+                submit_variables['input']['delivery']['deliveryLines'] = []
 
             if os.environ.get("SH2_DUMP"):
                 with open("/tmp/submit_vars_dump.json", "w") as f:
