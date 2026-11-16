@@ -792,6 +792,25 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 except Exception:
                     pass
 
+                # display price = the session's ACTUAL total (with automatic discounts
+                # applied by the store via acceptUnexpectedDiscounts)
+                if checkout_total_final:
+                    total_price = checkout_total_final
+                elif running_total and float(running_total) > 0:
+                    total_price = running_total
+
+                # delivery-state sync: the submit must reference the session's CURRENT
+                # strategy handle and line stableId (they rotate on every proposal)
+                try:
+                    _sd = (((_bp.get('delivery') or {}).get('deliveryLines')) or [{}])[0].get('selectedDeliveryStrategy') or {}
+                    if _sd.get('handle'):
+                        delivery_strategy = _sd['handle']
+                    _sl = ((_bres.get('buyerProposal') or {}).get('merchandise') or {}).get('merchandiseLines') or []
+                    if _sl and _sl[0].get('stableId'):
+                        stableId = _sl[0]['stableId']
+                except Exception:
+                    pass
+
             payload = {
                 "credit_card": {
                     "number": cc,
