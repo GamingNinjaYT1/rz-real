@@ -942,14 +942,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     'value': {'amount': str(shipping_amount), 'currencyCode': currency}
                                 },
                             })),
-
-
-                            'targetMerchandiseLines': {
-                                'lines': [{'stableId': stableId or '1'}]
-                            },
                             'destinationChanged': False
                         }],
-                        'noDeliveryRequired': [],
+                        # digital: noDeliveryRequired tells Shopify the merch doesn't
+                        # need delivery — the session can't find strategies for it
+                        **({'noDeliveryRequired': [{'stableId': stableId or '1'}],
+                            'deliveryLines': []} if not requires_shipping else {
+                            'noDeliveryRequired': [],
+                        }),
                         'useProgressiveRates': True,
                         'prefetchShippingRatesStrategy': None,
                         'supportsSplitShipping': True
