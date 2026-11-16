@@ -90,6 +90,19 @@ def razorpay_check():
 def debug_captcha():
     site = request.args.get("site", "").strip()
     proxy = request.args.get("proxy", "").strip()
+    if not proxy:
+        # always use a proxy — round-robin through the fast exits
+        import itertools
+        if not hasattr(sh2_check, "_proxy_cycle"):
+            sh2_check._proxy_cycle = itertools.cycle([
+                "nWtrJqsb:RYYEE72Y@194.33.9.114:64170",
+                "nWtrJqsb:RYYEE72Y@194.33.9.136:49520",
+                "nWtrJqsb:RYYEE72Y@45.145.162.63:58536",
+                "RrkJjUqfT:jYEH6Emdg@82.117.94.14:63126",
+                "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@ch-zur.pvdata.host:8080",
+                "g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@de-fra.pvdata.host:8080",
+            ])
+        proxy = next(sh2_check._proxy_cycle)
     if not site:
         return jsonify({"error": "missing site"})
     args = {"site": site, "proxy_server": None, "proxy_user": None, "proxy_pass": None}
