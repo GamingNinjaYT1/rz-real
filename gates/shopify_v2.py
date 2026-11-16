@@ -961,6 +961,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if checkpoint_data:
                 submit_variables['input']['checkpointData'] = checkpoint_data
 
+            # digital products (requiresShipping=false): replace deliveryLines with
+            # noDeliveryRequired — the delivery proposal negotiated the state, the
+            # submit tells Shopify "this merchandise doesn't need delivery"
+            if not requires_shipping:
+                _dv = submit_variables['input'].get('delivery', {})
+                _dv['deliveryLines'] = []
+                _dv['noDeliveryRequired'] = [{'stableId': stableId or '1'}]
+                submit_variables['input']['delivery'] = _dv
+
             # stores with payment-terms templates: the submit must echo the session's
             # selected flexibility terms id or the payment is rejected
             if flex_terms_id:
