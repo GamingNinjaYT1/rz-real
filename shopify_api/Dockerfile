@@ -6,4 +6,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY gates_shopify_v2.py .
 COPY app.py .
 ENV PORT=10000
-CMD gunicorn --worker-class gevent --workers 4 --bind 0.0.0.0:$PORT app:app
+CMD gunicorn --workers 4 --threads 8 --bind 0.0.0.0:$PORT app:app
