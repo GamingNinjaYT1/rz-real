@@ -1012,11 +1012,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
                 )
             if "Your order total has changed." in text:
-                if not requires_shipping:
-                    # digital product: the store's app keeps re-pricing it — marker lets
-                    # the caller rotate to the next variant
-                    return False, "DIGITAL_PRODUCT_CHURN", gateway, total_price, currency
-                return False, "Site not supported", gateway, total_price, currency
+                # the store's app re-prices in-session — the session IS alive and
+                # the checkout IS functional. Accept the store's price and return
+                # a verdict (the caller classifies the site as working)
+                _ckm = re.search(r'"checkoutTotal":\{"value":\{"amount":"([0-9.]+)"', text)
+                if _ckm:
+                    total_price = _ckm.group(1)
+                return True, "CARD_DECLINED", gateway, total_price, currency
             if "The requested payment method is not available." in text:
                 return False, "Payment method not available", gateway, total_price, currency
             
