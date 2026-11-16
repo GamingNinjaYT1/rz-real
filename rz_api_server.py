@@ -371,7 +371,7 @@ def _sa_run(cc):
 
 
 # ─── Shopify v2 lane (new checkout negotiation engine) — single-shot, no internal proxy logic ───
-_sh2_exec = concurrent.futures.ThreadPoolExecutor(max_workers=50)
+_sh2_exec = concurrent.futures.ThreadPoolExecutor(max_workers=200)
 
 @app.route("/sh2")
 def sh2_check():
