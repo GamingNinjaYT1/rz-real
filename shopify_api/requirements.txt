@@ -1,0 +1,5 @@
+flask>=3.0
+aiohttp>=3.9
+curl-cffi>=0.7
+gunicorn>=21.0
+gevent>=23.0
