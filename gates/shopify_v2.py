@@ -967,22 +967,13 @@ async def detect_currency_via_cartjs(session, domain, proxy, profile):
 
 
 async def detect_store_currency(session, domain, proxy, profile):
-    tasks = [
-        # meta.json = the SHOP's real currency (immune to IP-geo presentment);
-        # cart.js reflects the session's geo-adjusted currency — fallback only
-        asyncio.create_task(detect_currency_via_meta(session, domain, proxy, profile)),
-        asyncio.create_task(detect_currency_via_cartjs(session, domain, proxy, profile)),
-    ]
-    try:
-        for coro in asyncio.as_completed(tasks):
-            try:
-                r = await coro
-                if isinstance(r, str) and r:
-                    for t in tasks:
-                        if not t.done(): t.cancel()
-                    return r
-            except Exception: continue
-    except Exception: pass
+    # deterministic: meta.json (shop's real currency) first; cart.js (geo-adjusted) only as fallback
+    r = await detect_currency_via_meta(session, domain, proxy, profile)
+    if isinstance(r, str) and r:
+        return r
+    r = await detect_currency_via_cartjs(session, domain, proxy, profile)
+    if isinstance(r, str) and r:
+        return r
     return "USD"
 
 
@@ -1472,7 +1463,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 pin_h = build_headers(profile, ourl, for_document=True)
                 pin_h["referer"] = f"{ourl}/"
                 r_pin = await session.get(
-                    f"{ourl}/cart/{numeric_vid}:1?country={loc_country}&currency={currency}",
+                    f"{ourl}/?country={loc_country}&currency={currency}",
                     headers=pin_h, proxy=proxy, timeout=12, allow_redirects=True)
                 print(f"[pin] country={loc_country} currency={currency} → {str(r_pin.url)[:90]}")
             except Exception as e:
@@ -2047,6 +2038,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             payment_identifier = amt["payment_identifier"] or None
             if amt["gateway"]: gateway = amt["gateway"]
             payment_stable_id = amt["payment_stable_id"]
+            payment_terms_template_id = None
+            try:
+                _pf = ((_s2.get("payment") or {}).get("paymentFlexibilityPaymentTermsTemplate") or {})
+                if _pf.get("id"): payment_terms_template_id = _pf["id"]
+            except Exception:
+                pass
             payment_due_at = amt["payment_due_at"]
             payment_special = amt["payment_special"]
 
@@ -2068,6 +2065,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             _needs_total_poll = (_positive_amount(checkout_total) is None
                                  and _positive_amount(total_amount) is None)
             if _needs_total_poll:
+                print(f"[amount] P2 sellerProposal keys: {list((_s2 or {}).keys())[:10]}")
+                print(f"[amount] P2 seller.delivery: {(_s2.get('delivery') or {}).get('__typename')!r}")
+                print(f"[amount] P2 raw[:600]: {resp_text[:600]}")
                 for _tp in range(P2_TOTAL_POLL_MAX):
                     await asyncio.sleep(min(1.0 + 0.2 * _tp, 2.5))
                     response, resp_text = await gql(
@@ -2220,6 +2220,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if _cap3 and _cap3[0] not in (None, "PENDING"):
                     return False, "CARD_DECLINED", gateway, variant_price_fallback, currency
                 amt3 = _extract_amounts_from_seller(_p3_seller)
+                try:
+                    _pf3 = ((_p3_seller.get("payment") or {})
+                            .get("paymentFlexibilityPaymentTermsTemplate") or {})
+                    if _pf3.get("id"):
+                        payment_terms_template_id = _pf3["id"]
+                        print(f"[flex] P3 terms template: {payment_terms_template_id}")
+                except Exception:
+                    pass
                 if amt3["payment_identifier"]: payment_identifier = amt3["payment_identifier"]
                 if amt3["gateway"]: gateway = amt3["gateway"]
                 if amt3["payment_stable_id"]: payment_stable_id = amt3["payment_stable_id"]
