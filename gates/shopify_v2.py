@@ -1431,12 +1431,18 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 warm_headers = build_headers(profile, ourl, for_document=True)
                 xhr_headers = build_headers(profile, ourl, for_document=False)
 
-            try:
-                await session.get(ourl, headers=warm_headers, proxy=proxy,
-                                  timeout=8, allow_redirects=True)
-                print(f"[warmup] ✅ {time.time()-t0:.2f}s root primed")
-            except Exception as e:
-                print(f"[warmup] ⚠️ {str(e)[:80]}")
+            warmed = False
+            for _w in range(2):
+                try:
+                    await session.get(ourl, headers=warm_headers, proxy=proxy,
+                                      timeout=12, allow_redirects=True)
+                    print(f"[warmup] ✅ {time.time()-t0:.2f}s root primed")
+                    warmed = True
+                    break
+                except Exception as e:
+                    print(f"[warmup] ⚠️ {_w+1}/2 {str(e)[:80]}")
+                    await asyncio.sleep(1.0)
+            if not warmed:
                 return False, "Change Proxy", gateway, variant_price_fallback, currency
 
             # 🔥 FIX: Abort if this isn't a Shopify site
