@@ -391,7 +391,8 @@ def sh2_check():
         fut.cancel()
         return jsonify({"error": "shopify check timed out"}), 504
     except Exception as e:
-        return jsonify({"error": f"internal error: {type(e).__name__}"}), 500
+        import traceback as _tb
+        return jsonify({"error": f"internal error: {type(e).__name__}: {str(e)[:200]} :: {_tb.format_exc()[-400:]}"}, ), 500
     success, message, gateway, price, currency = res
     message = str(message)
     if message == "DIGITAL_PRODUCT_CHURN":
