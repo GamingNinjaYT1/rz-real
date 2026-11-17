@@ -942,6 +942,133 @@ async def verify_shopify_store(session, ourl, proxy, profile):
         pass
     return False
 
+async def fetch_products(domain, proxy_str=None, price_floor=None):
+    try:
+        if not domain.startswith('http'):
+            domain = "https://" + domain
+        
+        
+        proxy = parse_proxy(proxy_str) if proxy_str else None
+        
+        async with AsyncSession(impersonate="chrome", verify=False, timeout=15) as session:
+            if price_floor:
+                # deep catalog search: paginate until a variant priced at or above the
+                # store's minimum is found (VALIDATION_CUSTOM recovery)
+                for page in range(1, 9):
+                    resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxies={'http': proxy, 'https': proxy} if proxy else None, timeout=15)
+                    if resp.status_code != 200:
+                        return False, f"<b>Site Error! Status: {resp.status_code}</b>"
+                    text = resp.text
+                    if "shopify" not in text.lower():
+                        return False, "<b>Not Shopify!</b>"
+                    try:
+                        page_products = (resp.json()).get('products') or []
+                    except Exception:
+                        page_products = []
+                    if not page_products:
+                        return False, "<b>No Products above minimum</b>"
+                    best = None
+                    for product in page_products:
+                        if not product.get('variants'):
+                            continue
+                        for variant in product['variants']:
+                            if not variant.get('available', True):
+                                continue
+                            try:
+                                pr = float(str(variant.get('price', '0')).replace(',', ''))
+                            except (ValueError, TypeError):
+                                continue
+                            if pr >= price_floor and (best is None or pr < best[0]):
+                                best = (pr, str(variant['id']), f"{domain}/products/{product['handle']}")
+                    if best:
+                        return {'site': domain, 'price': f"{best[0]:.2f}", 'variant_id': best[1],
+                                'link': best[2], 'candidates': []}
+                    if len(page_products) < 250:
+                        return False, "<b>No Products above minimum</b>"
+                return False, "<b>No Products above minimum</b>"
+
+            # 2 pages (500 products) — measured sweet spot: 47% of big-catalog stores hide
+            # their true minimum on page 2; +0.5s per multi-page store only.
+            # 429 (rate limit) clears in seconds — brief backoff retry per page.
+            result = []
+            for page in range(1, 3):
+                resp_status = 0
+                for attempt in range(3):
+                    resp = await session.get(f"{domain}/products.json?limit=250&page={page}", proxies={'http': proxy, 'https': proxy} if proxy else None, timeout=15)
+                    resp_status = resp.status_code
+                    if resp.status_code == 429 and attempt < 2:
+                        await asyncio.sleep(2.5 * (attempt + 1))
+                        continue
+                    break
+                if resp_status != 200:
+                    if page == 1:
+                        return False, f"<b>Site Error! Status: {resp_status}</b>"
+                    break
+                text = resp.text
+                if "shopify" not in text.lower():
+                    if page == 1:
+                        return False, "<b>Not Shopify!</b>"
+                    break
+                try:
+                    page_products = (resp.json()).get('products') or []
+                except Exception:
+                    page_products = []
+                if not page_products:
+                    break
+                result.extend(page_products)
+                if len(page_products) < 250:
+                    break
+            if not result:
+                return False, "<b>No Products!</b>"
+
+        min_price = float('inf')
+        min_product = None
+        candidates = []
+
+        for product in result:
+            if not product.get('variants'):
+                continue
+            
+            for variant in product['variants']:
+                if not variant.get('available', True):
+                    continue
+                try:
+                    price = variant.get('price', '0')
+                    if isinstance(price, str):
+                        price = float(price.replace(',', ''))
+                    else:
+                        price = float(price)
+
+                    if price <= 0:
+                        continue
+
+                    candidates.append((price, str(variant['id'])))
+
+                    if price < min_price:
+                        min_price = price
+                        min_product = {
+                            'site': domain,
+                            'price': f"{price:.2f}",
+                            'variant_id': str(variant['id']),
+                            'link': f"{domain}/products/{product['handle']}"
+                        }
+                except (ValueError, TypeError, AttributeError):
+                    continue
+        
+        if isinstance(min_product, dict) and min_product.get('variant_id'):
+            others = sorted(candidates, key=lambda x: x[0])
+            min_product['candidates'] = [{"id": vid, "price": pr} for pr, vid in others if vid != min_product['variant_id']][:6]
+            return min_product
+        else:
+            return False, "<b>No Valid Products</b>"
+
+    except Exception as e:
+        return False, f"<b>Proxy Error: {str(e)}</b>"
+    except Exception as e:
+        return False, f"error: {str(e)}"
+
+
+
 async def detect_currency_via_meta(session, domain, proxy, profile):
     try:
         r = await session.get(f"{domain}/meta.json",
