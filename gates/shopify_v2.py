@@ -2672,9 +2672,12 @@ def shopify_checker():
         try: pf = float(str(price).replace(",", ""))
         except (ValueError, TypeError): pf = 0.0
         print(f"[REQ] 🏁 {elapsed:.2f}s | {clean} | {pf} {currency} | status={success}")
+        # signal proxy death so the caller's rotation drops this exit
+        proxy_dead = (clean == "Change Proxy")
         return _pretty({
             "Gateway": gateway, "Price": pf, "Currency": currency,
             "Response": clean, "Status": success,
+            "Proxy": "dead" if proxy_dead else "live",
             "cc": cc_string, "Time": f"{elapsed:.2f}s",
         })
     except Exception as e:
