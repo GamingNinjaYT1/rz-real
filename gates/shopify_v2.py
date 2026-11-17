@@ -2623,6 +2623,15 @@ def shopify_checker():
         try:
             success, message, gateway, price, currency = loop.run_until_complete(
                 process_card(cc, mes, ano, cvv, site, variant_id, proxy_str))
+            # 🔥 FIX: AVS zip mismatch — retry once with a different random address
+            if (not success and extract_clean_response(message) == "INCORRECT_ZIP"):
+                print(f"[REQ] 🔁 INCORRECT_ZIP → retrying with a fresh address")
+                loop2 = asyncio.new_event_loop()
+                try:
+                    success, message, gateway, price, currency = loop2.run_until_complete(
+                        process_card(cc, mes, ano, cvv, site, variant_id, proxy_str))
+                finally:
+                    loop2.close()
         finally:
             loop.close()
 

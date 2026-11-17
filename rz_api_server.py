@@ -419,6 +419,20 @@ def sh2_check():
     })
 
 def _sh2_run(cc, site, proxy, variant):
+    res = _sh2_run_once(cc, site, proxy, variant)
+    # 🔥 FIX: AVS zip mismatch — one retry with a freshly generated address
+    try:
+        if isinstance(res, tuple) and len(res) >= 2 and str(res[1]) == "INCORRECT_ZIP":
+            print("[sh2] INCORRECT_ZIP → retrying with a fresh address")
+            res2 = _sh2_run_once(cc, site, proxy, variant)
+            if isinstance(res2, tuple):
+                res = res2
+    except Exception:
+        pass
+    return res
+
+
+def _sh2_run_once(cc, site, proxy, variant):
     from gates.shopify_v2 import process_card as _sh2pc, fetch_products as _sfp
     import asyncio as _aio
     parts = cc.split("|")
