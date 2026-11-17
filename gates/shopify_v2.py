@@ -1025,7 +1025,7 @@ async def fetch_cheapest_candidate(session, domain, profile, proxy):
                     print(f"[candidates] request error {base_url}: {str(e)[:100]}")
                     continue
             if not result:
-                return False, "<b>No Purchasable Products!</b>", "UNKNOWN", "0.00", "USD"
+                return None
 
             best, best_price = None, float("inf")
             for prod in result:
@@ -1047,7 +1047,7 @@ async def fetch_cheapest_candidate(session, domain, profile, proxy):
             if best:
                 print(f"[candidates] ✅ cheapest {best['variant_id']} @ {best['price']}")
                 return best
-            return False, "<b>No Valid Products</b>", "UNKNOWN", "0.00", "USD"
+            return None
 
     except Exception as e:
         print(f"[candidates] EXCEPTION: {type(e).__name__}: {str(e)[:100]}")
