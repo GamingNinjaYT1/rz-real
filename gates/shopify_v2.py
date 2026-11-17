@@ -1002,10 +1002,12 @@ async def fetch_cheapest_candidate(session, domain, profile, proxy):
 
         async with AsyncSession(impersonate="chrome", verify=False, timeout=15) as fetch_session:
             result = None
+            saw_response = False
             for base_url in [f"{domain}/products.json", f"{domain}/collections/all/products.json"]:
                 for _try in range(3):
                     try:
                         r = await fetch_session.get(base_url, params={"limit": 250}, proxies=proxies, timeout=10)
+                        saw_response = True
                         if r.status_code == 429:
                             await asyncio.sleep(1.5 + 1.5 * _try)
                             continue
@@ -1023,6 +1025,10 @@ async def fetch_cheapest_candidate(session, domain, profile, proxy):
                 if result:
                     break
             if not result:
+                # every request died at the transport layer → the proxy is dead,
+                # not the catalog empty; report honestly so the caller rotates it
+                if not saw_response:
+                    return "PROXY_DEAD"
                 return None
 
             best, best_price = None, float("inf")
@@ -1438,6 +1444,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return_exceptions=True)
                 if isinstance(res[0], str) and res[0]: currency = res[0]
                 candidate = res[1] if not isinstance(res[1], Exception) else None
+                if candidate == "PROXY_DEAD":
+                    return False, "Change Proxy", gateway, "0.00", currency
                 print(f"[detect] ✅ {time.time()-t0:.2f}s currency={currency} candidate={'yes' if candidate else 'no'}")
 
             if not candidate and not variant_id:
