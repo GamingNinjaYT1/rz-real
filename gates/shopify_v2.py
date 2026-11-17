@@ -1384,6 +1384,21 @@ def _extract_amounts_from_seller(sp):
 # ═══════════════════════════════════════════════════════════════════════
 # Main flow
 # ═══════════════════════════════════════════════════════════════════════
+def _poll_after_seconds(val, default=2.0):
+    # pollAfter may be seconds OR an ISO timestamp ("2026-11-17T13:39:35Z")
+    try:
+        if isinstance(val, (int, float)):
+            return max(float(val), 1.5)
+        sv = str(val).strip()
+        if "T" in sv and ":" in sv:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(sv.replace("Z", "+00:00"))
+            return max((dt - datetime.now(timezone.utc)).total_seconds(), 1.5)
+        return max(float(sv), 1.5)
+    except Exception:
+        return default
+
+
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
     gateway = "UNKNOWN"
     currency = "USD"
@@ -1843,7 +1858,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if rtype == "CheckpointDenied":
                 return False, "Checkpoint Denied", gateway, variant_price_fallback, currency
             if rtype == "Throttled":
-                wait = float(result.get("pollAfter") or 2.0)
+                wait = _poll_after_seconds(result.get("pollAfter"))
                 await asyncio.sleep(max(wait, 1.5))
                 return False, "Throttled", gateway, variant_price_fallback, currency
             if rtype == "NegotiationResultFailed":
@@ -2459,7 +2474,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             elif result_type == "TooManyRequests":
                 return False, "TOO_MANY_REQUESTS", gateway, variant_price_fallback, currency
             elif result_type == "Throttled":
-                wait = float(submit_data.get("pollAfter") or 2.0)
+                wait = _poll_after_seconds(submit_data.get("pollAfter"))
                 await asyncio.sleep(max(wait, 1.5))
                 return False, "Throttled", gateway, variant_price_fallback, currency
             elif result_type == "CheckpointDenied":
