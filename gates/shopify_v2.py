@@ -1000,56 +1000,64 @@ async def probe_cart_requires_shipping(session, domain, proxy, profile):
 
 
 async def fetch_cheapest_candidate(session, domain, profile, proxy):
-    endpoints = [
-        f"{domain}/products.json",
-        f"{domain}/collections/all/products.json",
-    ]
-    # try WITH proxy first, then WITHOUT (direct from VPS — different rate limit pool)
-    for use_idx, use_proxy in enumerate([proxy, None]):
-        if use_idx > 0:
-            await asyncio.sleep(2)  # cool down between proxy and direct attempts
-        for base_url in endpoints:
-            best, best_price = None, float("inf")
-            for page in range(1, 3):
+    try:
+        if not domain.startswith('http'):
+            domain = "https://" + domain
+
+        proxy = parse_proxy(proxy) if proxy else None
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+
+        async with AsyncSession(impersonate="chrome", verify=False, timeout=15) as fetch_session:
+            result = None
+            for base_url in [f"{domain}/products.json", f"{domain}/collections/all/products.json"]:
                 try:
-                    r = await session.get(base_url,
-                                          params={"limit": 250, "page": page},
-                                          proxy=use_proxy, timeout=15)
+                    r = await fetch_session.get(base_url, params={"limit": 250}, proxies=proxies, timeout=10)
+                    if r.status_code != 200:
+                        print(f"[candidates] {base_url} HTTP {r.status_code}")
+                        continue
+                    text = r.text
+                    if "shopify" not in text.lower():
+                        continue
+                    result = r.json().get("products") or []
+                    if result:
+                        break
                 except Exception as e:
                     print(f"[candidates] request error {base_url}: {str(e)[:100]}")
-                    break
-                if r.status_code in (400, 403, 404):
-                    print(f"[candidates] {base_url} → {r.status_code} (trying next endpoint)")
-                    break
-                if r.status_code != 200:
-                    print(f"[candidates] {base_url} HTTP {r.status_code}")
-                    break
-                try:
-                    items = (r.json() or {}).get("products", [])
-                except Exception:
-                    break
-                if not items:
-                    break
-                for prod in items:
-                    handle = prod.get("handle", "")
-                    for v in prod.get("variants", []):
-                        try:
-                            price = float(v.get("price", "0"))
-                        except (ValueError, TypeError):
-                            continue
-                        if price < MIN_PRICE or price >= best_price:
-                            continue
-                        best_price = price
-                        best = {
-                            "variant_id": str(v.get("id", "")),
-                            "price": f"{price:.2f}",
-                            "handle": handle,
-                            "requires_shipping": v.get("requires_shipping", True),
-                        }
-                if best:
-                    print(f"[candidates] ✅ cheapest {best['variant_id']} @ {best['price']} (via {base_url})")
-                    return best
+                    continue
+            if not result:
+                return False, "<b>No Purchasable Products!</b>", "UNKNOWN", "0.00", "USD"
+
+            best, best_price = None, float("inf")
+            for prod in result:
+                handle = prod.get("handle", "")
+                for v in prod.get("variants", []):
+                    try:
+                        price = float(v.get("price", "0"))
+                    except (ValueError, TypeError):
+                        continue
+                    if price < MIN_PRICE or price >= best_price:
+                        continue
+                    best_price = price
+                    best = {
+                        "variant_id": str(v.get("id", "")),
+                        "price": f"{price:.2f}",
+                        "handle": handle,
+                        "requires_shipping": v.get("requires_shipping", True),
+                    }
+            if best:
+                print(f"[candidates] ✅ cheapest {best['variant_id']} @ {best['price']}")
+                return best
+            return False, "<b>No Valid Products</b>", "UNKNOWN", "0.00", "USD"
+
+    except Exception as e:
+        print(f"[candidates] EXCEPTION: {type(e).__name__}: {str(e)[:100]}")
         return None
+
+
+
+    except Exception as e:
+        return None  # error — the caller handles None as 'no candidate'
+
 
         if best:
             print(f"[candidates] ✅ cheapest via {'proxy' if use_proxy else 'direct'}")
@@ -1345,7 +1353,8 @@ def _extract_amounts_from_seller(sp):
         pl = pay.get("paymentLines") or []
         if pl and isinstance(pl[0], dict):
             out["payment_stable_id"] = pl[0].get("stableId")
-            out["payment_due_at"] = pl[0].get("dueAt")
+            _due = pl[0].get("dueAt")
+            out["payment_due_at"] = None if (_due and 'T' in str(_due)) else _due
             out["payment_special"] = pl[0].get("specialInstructions")
     except Exception: pass
     return out
@@ -2006,7 +2015,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             # capture the session's ACTUAL presentment currency — the buyer identity
             # must match this or the submit gets CURRENCY_DOES_NOT_MATCH
+            # try multiple sources: buyer runningTotal → seller checkoutTotal → response text
             _cc2 = ((_r2.get("buyerProposal") or {}).get("runningTotal") or {}).get("value", {}).get("currencyCode")
+            if not _cc2:
+                _cc2 = ((_s2.get("checkoutTotal") or {}).get("value") or {}).get("currencyCode")
+            if not _cc2:
+                _ccm = re.search(r'"currencyCode"\s*:\s*"([A-Z]{3})"', resp_text)
+                if _ccm:
+                    _cc2 = _ccm.group(1)
             if _cc2:
                 currency = str(_cc2)
 
