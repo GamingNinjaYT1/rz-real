@@ -1003,6 +1003,7 @@ async def fetch_cheapest_candidate(session, domain, profile, proxy):
         async with AsyncSession(impersonate="chrome", verify=False, timeout=15) as fetch_session:
             result = None
             saw_response = False
+            waf_blocked = False
             for base_url in [f"{domain}/products.json", f"{domain}/collections/all/products.json"]:
                 for _try in range(3):
                     try:
@@ -1011,6 +1012,11 @@ async def fetch_cheapest_candidate(session, domain, profile, proxy):
                         if r.status_code == 429:
                             await asyncio.sleep(1.5 + 1.5 * _try)
                             continue
+                        if r.status_code in (401, 403, 503):
+                            # WAF challenge — this PROXY's IP is flagged, not the store
+                            print(f"[candidates] {base_url} HTTP {r.status_code} (WAF/proxy)")
+                            waf_blocked = True
+                            break
                         if r.status_code != 200:
                             print(f"[candidates] {base_url} HTTP {r.status_code}")
                             break
@@ -1025,9 +1031,9 @@ async def fetch_cheapest_candidate(session, domain, profile, proxy):
                 if result:
                     break
             if not result:
-                # every request died at the transport layer → the proxy is dead,
-                # not the catalog empty; report honestly so the caller rotates it
-                if not saw_response:
+                # transport failure OR WAF block → the proxy is the problem, not
+                # the catalog; report so the caller rotates the proxy
+                if not saw_response or waf_blocked:
                     return "PROXY_DEAD"
                 return None
 
