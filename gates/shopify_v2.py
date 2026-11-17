@@ -2539,12 +2539,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         return False, "BELOW_MERCHANT_MINIMUM", gateway, total_price, currency
                     if raw_code == "PAYMENTS_INSUFFICIENT_FUNDS":
                         raw_code = "INSUFFICIENT_FUNDS"
-                    if raw_code == "CAPTCHA_REQUIRED":
-                        # Payment processor returned a decline code of
-                        # CAPTCHA_REQUIRED — this is a payment decline, NOT a
-                        # bot-detection wall.  The card was submitted and
-                        # processed successfully but the payment was rejected.
-                        raw_code = "CARD_DECLINED"
+                    # CAPTCHA_REQUIRED is surfaced as-is (store risk challenge)
                     return False, raw_code, gateway, total_price, currency
                 if tn == "ActionRequiredReceipt":
                     return False, "3DS_REQUIRED", gateway, total_price, currency
