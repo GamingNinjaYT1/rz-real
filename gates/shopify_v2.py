@@ -498,7 +498,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 'options': {}
                             },
                             'targetMerchandiseLines': {'any': True},
-                            'deliveryMethodTypes': ['SHIPPING'],
+                            'deliveryMethodTypes': ['NONE'] if not requires_shipping else ['SHIPPING'],
                             'expectedTotalPrice': {'any': True},
                             'destinationChanged': True
                         }],
