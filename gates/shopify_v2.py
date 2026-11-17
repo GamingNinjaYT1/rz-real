@@ -1405,6 +1405,23 @@ def _poll_after_seconds(val, default=2.0):
         return default
 
 
+# ── per-proxy concurrency gate ────────────────────────────────────────
+# Shopify's risk engine challenges bursts from a single exit IP. Rukia-style
+# checkers keep ≤2 concurrent checkouts per IP; this gate does the same.
+_PROXY_SEMAPHORES = {}
+_PROXY_GLock = threading.Lock()
+PROXY_MAX_CONCURRENT = 2
+
+def _proxy_gate(proxy):
+    key = (proxy or "direct").split("@")[-1] or "direct"
+    with _PROXY_GLock:
+        sem = _PROXY_SEMAPHORES.get(key)
+        if sem is None:
+            sem = asyncio.Semaphore(PROXY_MAX_CONCURRENT)
+            _PROXY_SEMAPHORES[key] = sem
+    return sem
+
+
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
     gateway = "UNKNOWN"
     currency = "USD"
