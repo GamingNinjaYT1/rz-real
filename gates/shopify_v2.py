@@ -1064,7 +1064,7 @@ async def fetch_cheapest_candidate(session, domain, profile, proxy):
     if not all_cands:
         try:
             gq = {"query": """{ products(first: 250) { edges { node { handle
-                variants(first: 100) { edges { node { id price availableForSale requiresShipping } } } } } } }"""}
+                variants(first: 100) { edges { node { id price { amount currencyCode } availableForSale requiresShipping } } } } } } }"""}
             gr = await session.post(f"{domain}/api/2024-01/graphql.json", json=gq,
                                     headers=_probe_headers(profile, domain), proxy=proxy, timeout=15)
             if gr.status_code == 200:
@@ -1075,7 +1075,8 @@ async def fetch_cheapest_candidate(session, domain, profile, proxy):
                     for ve in (node.get("variants", {}) or {}).get("edges", []):
                         vn = ve.get("node") or {}
                         try:
-                            price = float(str(vn.get("price", "0")).replace(",", ""))
+                            _pm = vn.get("price") or {}
+                            price = float(str(_pm.get("amount", "0")).replace(",", ""))
                         except (ValueError, TypeError):
                             continue
                         if price <= 0:
