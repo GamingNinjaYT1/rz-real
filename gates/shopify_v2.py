@@ -726,11 +726,17 @@ def _billing_street_dict(street, address2, city, country_code, s_zip,
     }
 
 
-def _rebuild_identity_for_currency(proposal_variables, new_currency, first, last):
+def _rebuild_identity_for_currency(proposal_variables, new_currency, first, last, cc_override=None):
     """BUYER_IDENTITY retry: presentment currency and buyer country/address MUST
-    move together — a new currency with the old country gets rejected again."""
-    addr = pick_addr(new_currency)
-    cc = addr["countryCode"]
+    move together — a new currency with the old country gets rejected again.
+    cc_override: the checkout session's OWN market country (preferred)."""
+    addr = None
+    cc = (cc_override or "").upper()
+    if cc:
+        addr = pick_addr_for_country(cc)
+    if not addr:
+        addr = pick_addr(new_currency)
+        cc = addr["countryCode"]
     phone = addr["phone"]; street = addr["address1"]
     city = addr["city"]; state = addr["zoneCode"]; s_zip = addr["postalCode"]
     try:
@@ -909,6 +915,35 @@ class Utils:
     def generate_email(first, last):
         domains = ["gmail.com","yahoo.com","outlook.com","hotmail.com"]
         return f"{first.lower()}{last.lower()}{random.randint(10,9999)}@{random.choice(domains)}"
+
+
+def pick_addr_for_country(cc):
+    """Address for an EXPLICIT market country (the checkout session's own
+    buyerIdentity.countryCode) — bypasses the currency→country map."""
+    cc = (cc or "").upper()
+    if cc == "US":
+        e = _gen_us_addr()
+        e["countryCode"] = "US"
+        return e
+    if cc and cc in book and cc in SHOPIFY_PAYMENTS_COUNTRIES:
+        e = random.choice(book[cc]).copy()
+        e["countryCode"] = cc
+        return e
+    return None
+
+
+def _parse_session_identity(html_text):
+    """The checkout HTML embeds Shopify's OWN session-resolved buyer identity:
+    "customer":{"presentmentCurrency":"USD","countryCode":"US","market":{...}}
+    These two values are the ground truth the P1 proposal must mirror."""
+    try:
+        m = re.search(r'"presentmentCurrency"\s*:\s*"([A-Z]{3})"\s*,\s*"countryCode"\s*:\s*"([A-Z]{2})"',
+                      html_text or "")
+        if m:
+            return m.group(1), m.group(2)
+    except Exception:
+        pass
+    return None, None
 
 
 def pick_addr(currency):
@@ -1946,7 +1981,18 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             unesc = text.replace("&quot;", '"').replace("&amp;", "&").replace("&#39;", "'")
             
-            addr = pick_addr(currency)
+            # 🔥 ROOT FIX: mirror Shopify's OWN session identity — the checkout
+            # HTML's buyerIdentity (presentmentCurrency + market country) is the
+            # exact combo the session was created with; using anything else
+            # (static currency→country maps) is what causes
+            # BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH
+            _scur, _scc = _parse_session_identity(unesc)
+            if _scur and _scur != currency:
+                print(f"[currency] 🔧 {currency} → {_scur} (session buyerIdentity)")
+                currency = _scur
+            addr = (pick_addr_for_country(_scc) if _scc else None) or pick_addr(currency)
+            if _scc and addr and addr["countryCode"] == _scc.upper():
+                print(f"[identity] 🎯 session market country {_scc}")
             country_code = addr["countryCode"]
 
             firstName, lastName = Utils.get_random_name()
@@ -2139,10 +2185,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 _p1err = str(resp_json['errors'][0].get('message', ''))
                 if "PRESENTMENT_CURRENCY" in _p1err.upper():
                     try:
-                        _fix = await redetect_supported_currency(session, ourl, proxy, profile, currency)
+                        _fix = _fix_cc = None
+                        _scur2, _scc2 = _parse_session_identity(text)
+                        if _scur2 and _scur2 != currency:
+                            _fix, _fix_cc = _scur2, _scc2
+                        if not _fix:
+                            _fix = await redetect_supported_currency(session, ourl, proxy, profile, currency)
                         if isinstance(_fix, str) and _fix and _fix != currency:
                             print(f"[currency] P1 mismatch → session currency {_fix} (was {currency})")
-                            currency, country_code = _rebuild_identity_for_currency(proposal_variables, _fix, firstName, lastName)
+                            currency, country_code = _rebuild_identity_for_currency(proposal_variables, _fix, firstName, lastName, cc_override=_fix_cc)
                             response, resp_text = await gql(
                                 session, "Proposal", headers, proposal_payload, proxy,
                                 checkout_html=text, checkout_origin=checkout_origin,
@@ -2176,10 +2227,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 # (shares the session cookies) and re-propose ONCE
                 if "PRESENTMENT_CURRENCY" in _joined:
                     try:
-                        _fix = await redetect_supported_currency(session, ourl, proxy, profile, currency)
+                        _fix = _fix_cc = None
+                        _scur2, _scc2 = _parse_session_identity(text)
+                        if _scur2 and _scur2 != currency:
+                            _fix, _fix_cc = _scur2, _scc2
+                        if not _fix:
+                            _fix = await redetect_supported_currency(session, ourl, proxy, profile, currency)
                         if isinstance(_fix, str) and _fix and _fix != currency:
                             print(f"[currency] negotiate mismatch → session currency {_fix}")
-                            currency, country_code = _rebuild_identity_for_currency(proposal_variables, _fix, firstName, lastName)
+                            currency, country_code = _rebuild_identity_for_currency(proposal_variables, _fix, firstName, lastName, cc_override=_fix_cc)
                             response, resp_text = await gql(
                                 session, "Proposal", headers, proposal_payload, proxy,
                                 checkout_html=text, checkout_origin=checkout_origin,
