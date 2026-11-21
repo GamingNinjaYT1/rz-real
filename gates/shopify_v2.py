@@ -992,12 +992,15 @@ async def verify_shopify_store(session, ourl, proxy, profile):
     🔥 returns "CONNECTION_DEAD" when zero HTTP responses arrived (dead egress)
     — callers must NOT declare NOT_SHOPIFY in that case (msh deletes sites!)."""
     _got_http = False
+    _got_200 = False
     try:
         h = _probe_headers(profile, ourl)
         for _try in range(4):
             try:
                 r = await session.get(f"{ourl}/meta.json", headers=h, proxy=proxy, timeout=8)
                 _got_http = True
+                if r.status_code == 200:
+                    _got_200 = True
             except Exception:
                 await asyncio.sleep(0.5)
                 continue
@@ -1021,6 +1024,7 @@ async def verify_shopify_store(session, ourl, proxy, profile):
                 await asyncio.sleep(0.5)
                 continue
             if r2.status_code == 200:
+                _got_200 = True
                 try:
                     data = r2.json()
                     if "items" in data and "currency" in data:
@@ -1034,7 +1038,11 @@ async def verify_shopify_store(session, ourl, proxy, profile):
             break
     except Exception:
         pass
-    return False if _got_http else "CONNECTION_DEAD"
+    # WAF codes (403/429/503) are NOT evidence the store is fake — only a real
+    # 200 with non-Shopify content is. Egress-side failures → Change Proxy.
+    if not _got_200:
+        return "CONNECTION_DEAD"
+    return False
 
 async def detect_currency_via_meta(session, domain, proxy, profile):
     try:
@@ -2009,6 +2017,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             # (static currency→country maps) is what causes
             # BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH
             _scur, _scc = _parse_session_identity(unesc)
+            if not _scur and _looks_like_connection_error(text):
+                # checkout HTML came back as a WAF/challenge page — no session
+                # identity to mirror, the proposal would be built on garbage
+                print(f"[checkout] ⛔ WAF page instead of checkout → Change Proxy")
+                return False, "Change Proxy", gateway, variant_price_fallback, currency
             if _scur and _scur != currency:
                 print(f"[currency] 🔧 {currency} → {_scur} (session buyerIdentity)")
                 currency = _scur
